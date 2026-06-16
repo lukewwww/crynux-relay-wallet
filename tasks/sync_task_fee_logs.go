@@ -57,6 +57,8 @@ var ErrTaskFeeVestingRecordNotFound = NewTaskFeeError("vesting record not found"
 var ErrTaskFeeVestingReleaseInvalid = NewTaskFeeError("vesting release is invalid")
 var ErrTaskFeeWithdrawalFeeAddressMismatch = NewTaskFeeError("withdrawal fee income address does not match configured address")
 
+const maxTaskFeeLogFutureDrift = time.Hour
+
 type depositPayload struct {
 	TxHash  string `json:"tx_hash"`
 	Network string `json:"network"`
@@ -451,6 +453,10 @@ func applyVestingReleaseLog(ctx context.Context, tx *gorm.DB, eventLog relay_api
 	if !ok || eventAmount.Sign() <= 0 {
 		return ErrTaskFeeVestingReleaseInvalid
 	}
+	eventCreatedAt := time.Unix(int64(eventLog.CreatedAt), 0).UTC()
+	if eventCreatedAt.After(time.Now().UTC().Add(maxTaskFeeLogFutureDrift)) {
+		return ErrTaskFeeVestingReleaseInvalid
+	}
 
 	var record models.VestingRecord
 	if err := tx.WithContext(ctx).
@@ -477,7 +483,7 @@ func applyVestingReleaseLog(ctx context.Context, tx *gorm.DB, eventLog relay_api
 		&record.TotalAmount.Int,
 		record.StartTime,
 		record.DurationDays,
-		time.Unix(int64(eventLog.CreatedAt), 0).UTC(),
+		eventCreatedAt,
 	)
 	if releaseTo.Cmp(shouldReleased) > 0 {
 		return ErrTaskFeeVestingReleaseInvalid

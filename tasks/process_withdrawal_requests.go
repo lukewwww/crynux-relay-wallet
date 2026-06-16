@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -256,7 +257,7 @@ func checkWithdrawalRequests(ctx context.Context, db *gorm.DB, requests []relay_
 		if err != nil {
 			return err
 		}
-		if ba.Hex() != request.BenefitAddress {
+		if !strings.EqualFold(ba.Hex(), request.BenefitAddress) {
 			return ErrWithdrawalRequestBeneficialAddressInvalid
 		}
 	}

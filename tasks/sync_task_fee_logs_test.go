@@ -148,6 +148,18 @@ func TestParseVestingReleasePayloadRejectsMissingVestingID(t *testing.T) {
 	}
 }
 
+func TestApplyVestingReleaseLogRejectsFarFutureCreatedAt(t *testing.T) {
+	err := applyVestingReleaseLog(context.Background(), nil, relay_api.TaskFeeLog{
+		Amount:    "1",
+		CreatedAt: uint64(time.Now().UTC().Add(maxTaskFeeLogFutureDrift + time.Second).Unix()),
+	}, &vestingReleasePayload{
+		VestingID: 42,
+	})
+	if !errors.Is(err, ErrTaskFeeVestingReleaseInvalid) {
+		t.Fatalf("expected ErrTaskFeeVestingReleaseInvalid, got %v", err)
+	}
+}
+
 func TestParseVestingPayloadRequiresValidType(t *testing.T) {
 	validPayload := `{"vesting_id":42,"address":"0x1111111111111111111111111111111111111111","total_amount":"1000","released_amount":"0","start_time":1767225600,"duration_days":30,"type":"delegation","source":"emission","external_id":"batch-1","admin_signature":"0xabc"}`
 	payload, err := parseVestingPayload(relay_api.TaskFeeLog{Payload: validPayload})
