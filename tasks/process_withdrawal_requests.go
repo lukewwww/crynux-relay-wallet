@@ -2,6 +2,7 @@ package tasks
 
 import (
 	"context"
+	"crynux_relay_wallet/alert"
 	"crynux_relay_wallet/blockchain"
 	"crynux_relay_wallet/config"
 	"crynux_relay_wallet/models"
@@ -538,6 +539,20 @@ func handleTimeoutWithdrawalRequest(ctx context.Context, db *gorm.DB, record *mo
 		if err != nil {
 			return err
 		}
+		if blockchainTransaction.Status == models.TransactionStatusConfirmed ||
+			blockchainTransaction.Status == models.TransactionStatusCancelled ||
+			(blockchainTransaction.Status == models.TransactionStatusFailed && blockchainTransaction.RetryCount >= blockchainTransaction.MaxRetries) {
+			log.WithFields(log.Fields{
+				"record_id":                 record.ID,
+				"remote_id":                 record.RemoteID,
+				"blockchain_transaction_id": blockchainTransaction.ID,
+				"transaction_status":        blockchainTransaction.Status,
+				"tx_hash":                   blockchainTransaction.TxHash.String,
+			}).Info("ProcessWithdrawalRecords: finalizing timeout withdrawal record with terminal blockchain transaction")
+			finalizeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			return processWithdrawalRecord(finalizeCtx, db, record)
+		}
 		if blockchainTransaction.Status == models.TransactionStatusPending && !blockchainTransaction.TxHash.Valid {
 			cancelled, err := blockchainTransaction.CancelUnbroadcasted(ctx, db, "Withdrawal request timed out before broadcast")
 			if err != nil {
@@ -552,15 +567,24 @@ func handleTimeoutWithdrawalRequest(ctx context.Context, db *gorm.DB, record *mo
 				return nil
 			}
 		}
-		if blockchainTransaction.Status == models.TransactionStatusCancelled {
-			if err := rejectTimeoutWithdrawalRequest(context.Background(), db, record); err != nil {
-				return fmt.Errorf("ProcessWithdrawalRecords: cannot reject timeout withdrawal request due to %w", err)
-			}
-			logWithdrawalRecordFailed(record, ErrWithdrawalRequestTransactionUnconfirmedTimeout, blockchainTransaction)
-			log.Infof("ProcessWithdrawalRecords: rejected timeout withdrawal record %d with cancelled blockchain transaction %d", record.ID, blockchainTransaction.ID)
-			return nil
-		}
-		log.Errorf("ProcessWithdrawalRecords: withdrawal record %d has non-cancellable blockchain transaction %d after timeout", record.ID, blockchainTransaction.ID)
+		blockingMessage := fmt.Sprintf(
+			"withdrawal processor stopped because timeout transaction is not cancellable or terminal: record_id=%d remote_id=%d blockchain_transaction_id=%d transaction_status=%d tx_hash=%s status_message=%s",
+			record.ID,
+			record.RemoteID,
+			blockchainTransaction.ID,
+			blockchainTransaction.Status,
+			blockchainTransaction.TxHash.String,
+			blockchainTransaction.StatusMessage.String,
+		)
+		log.WithFields(log.Fields{
+			"record_id":                 record.ID,
+			"remote_id":                 record.RemoteID,
+			"blockchain_transaction_id": blockchainTransaction.ID,
+			"transaction_status":        blockchainTransaction.Status,
+			"tx_hash":                   blockchainTransaction.TxHash.String,
+			"status_message":            blockchainTransaction.StatusMessage.String,
+		}).Error("ProcessWithdrawalRecords: " + blockingMessage)
+		alert.SafeSendAlert("ProcessWithdrawalRequests", blockingMessage)
 		return ErrWithdrawalRequestTransactionUnconfirmedTimeout
 	}
 	if err := rejectTimeoutWithdrawalRequest(context.Background(), db, record); err != nil {
@@ -594,6 +618,11 @@ func processWithdrawalRecordWithRetry(ctx context.Context, db *gorm.DB, record *
 		log.Errorf("ProcessWithdrawalRecords: process withdrawal record %d error %v", record.ID, err)
 		if IsWithdrawalRequestError(err) {
 			logWithdrawalRecordFailed(record, err, nil)
+			log.WithFields(log.Fields{
+				"record_id": record.ID,
+				"remote_id": record.RemoteID,
+				"error":     err.Error(),
+			}).Error("ProcessWithdrawalRecords: processor is stopping; later withdrawal records are blocked")
 			return err
 		}
 

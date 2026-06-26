@@ -116,6 +116,10 @@ The sender MUST use the persisted transaction state as the concurrency boundary.
 
 This design deliberately keeps withdrawal execution globally serial. A withdrawal record delayed by dynamic fee caps blocks later withdrawal records, including records for other networks, until it succeeds or reaches timeout. If timeout occurs while its blockchain transaction is still unbroadcasted and cancellable, the wallet MUST cancel that transaction before rejecting the Relay withdrawal.
 
+After a transaction is broadcast and a `tx_hash` is recorded, withdrawal timeout MUST NOT be used to reject or refund the Relay withdrawal. The withdrawal MUST remain bound to the chain transaction result.
+
+When the timeout handler runs, including after a service restart, it MUST first inspect the persisted blockchain transaction state. This inspection is a recovery step for records whose chain transaction state changed outside the active withdrawal processor, such as a transaction confirmed after the processor had already stopped. If the transaction is already in a terminal local state, processing MUST resume through the normal success or failure finalization path. If the transaction is still broadcast and non-terminal at that moment, the processor MUST NOT keep waiting past the withdrawal deadline. It MUST log an error with the withdrawal record ID, remote ID, blockchain transaction ID, transaction status, and transaction hash, then return an error for the alerting path and stop processing later withdrawal records.
+
 The wallet does not separately estimate or cap rollup parent-chain data fees through chain-specific fee oracle contracts. For supported EVM rollups, fee control is limited to standard gas estimation, buffered `gas_limit`, and EIP-1559 fee caps. Arbitrum Nitro-style gas estimates include the parent-chain posting buffer in the returned gas estimate. Base-style L1 security fee estimation is not a separate requirement in this wallet.
 
 ## Timeout Handling
@@ -128,8 +132,8 @@ If deadline is exceeded:
 
 - If no blockchain transaction is attached, call Relay `RejectWithdrawalRequest` and set local status to `finished`.
 - If the current blockchain transaction is `pending` and has no `tx_hash`, atomically change it to `cancelled`, call Relay `RejectWithdrawalRequest`, and set local status to `finished`.
-- If the current blockchain transaction is already `cancelled`, call Relay `RejectWithdrawalRequest` and set local status to `finished`.
-- If the current blockchain transaction is `sending`, `sent`, or otherwise not cancellable, do not reject the Relay withdrawal. Return timeout error for the alerting path.
+- If the current blockchain transaction has been broadcast or is otherwise not cancellable and has not reached a terminal state at timeout handling time, do not reject the Relay withdrawal and do not continue waiting. Log the blocking transaction context, return timeout error for the alerting path, and stop processing later withdrawal records.
+- If the current blockchain transaction reached a terminal local state before timeout handling, resume normal finalization from that terminal state. This covers recovery after processor interruption; it is not a continued wait past the withdrawal deadline.
 
 ## Balance Ownership Rule
 
