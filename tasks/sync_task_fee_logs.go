@@ -78,8 +78,6 @@ type vestingPayload struct {
 	StartTime      int64  `json:"start_time"`
 	DurationDays   uint   `json:"duration_days"`
 	Type           string `json:"type"`
-	Source         string `json:"source"`
-	ExternalID     string `json:"external_id"`
 	AdminSignature string `json:"admin_signature"`
 }
 
@@ -327,8 +325,6 @@ func parseVestingPayload(eventLog relay_api.TaskFeeLog) (*vestingPayload, error)
 		payload.StartTime <= 0 ||
 		payload.DurationDays == 0 ||
 		payload.Type == "" ||
-		payload.Source == "" ||
-		payload.ExternalID == "" ||
 		payload.AdminSignature == "" {
 		return nil, ErrTaskFeeVestingPayloadInvalid
 	}
@@ -374,8 +370,6 @@ func recoverVestingSigner(payload *vestingPayload) (string, error) {
 		StartTime:    payload.StartTime,
 		DurationDays: payload.DurationDays,
 		Type:         payload.Type,
-		Source:       payload.Source,
-		ExternalID:   payload.ExternalID,
 	})
 	prefix := fmt.Sprintf("\x19Ethereum Signed Message:\n%d", len(message))
 	messageHash := crypto.Keccak256([]byte(prefix + message))
@@ -425,8 +419,6 @@ func upsertVestingCreateLog(ctx context.Context, tx *gorm.DB, eventLog relay_api
 			StartTime:      time.Unix(payload.StartTime, 0).UTC(),
 			DurationDays:   payload.DurationDays,
 			Type:           payload.Type,
-			Source:         payload.Source,
-			ExternalID:     payload.ExternalID,
 			AdminSignature: payload.AdminSignature,
 			Status:         models.VestingStatusActive,
 		}
@@ -440,9 +432,7 @@ func upsertVestingCreateLog(ctx context.Context, tx *gorm.DB, eventLog relay_api
 		record.TotalAmount.String() != totalAmount.String() ||
 		record.StartTime.Unix() != payload.StartTime ||
 		record.DurationDays != payload.DurationDays ||
-		record.Type != payload.Type ||
-		record.Source != payload.Source ||
-		record.ExternalID != payload.ExternalID {
+		record.Type != payload.Type {
 		return ErrTaskFeeVestingPayloadInvalid
 	}
 	return nil

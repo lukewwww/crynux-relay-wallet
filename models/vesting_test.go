@@ -14,11 +14,9 @@ func TestBuildVestingSignMessageIncludesType(t *testing.T) {
 		StartTime:    1767225600,
 		DurationDays: 30,
 		Type:         VestingTypeNode,
-		Source:       "emission",
-		ExternalID:   "batch-1",
 	})
 
-	if !strings.Contains(message, "\nType: node\n") {
+	if !strings.HasSuffix(message, "\nType: node") {
 		t.Fatalf("expected vesting sign message to include type, got %q", message)
 	}
 }
