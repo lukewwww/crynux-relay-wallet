@@ -6,7 +6,7 @@ This document defines how Relay Wallet handles withdrawal fees while processing 
 
 ## Fee Source
 
-Relay is the authority for withdrawal fee amount. Relay Wallet MUST read `withdrawal_fee` from each withdrawal request returned by Relay `GetWithdrawalRequests`.
+Relay is the authority for withdrawal fee amount. Relay computes the fee per request from its own configuration (a fixed fee plus an amount-tiered proportional fee) and fixes the value when the withdrawal request is created. Relay Wallet MUST read `withdrawal_fee` from each withdrawal request returned by Relay `GetWithdrawalRequests`.
 
 Relay Wallet MUST NOT compute the fee amount from local configuration. Relay Wallet MUST NOT derive a withdrawal request fee amount from `WithdrawalFeeIncome` logs.
 

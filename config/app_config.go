@@ -81,9 +81,10 @@ type AppConfig struct {
 			DepositMaxAgeSeconds       uint64 `mapstructure:"deposit_max_age_seconds"`
 		} `mapstructure:"sync_task_fee_logs"`
 		SyncWithdrawalRequests struct {
-			IntervalSeconds     uint   `mapstructure:"interval_seconds"`
-			BatchSize           uint   `mapstructure:"batch_size"`
-			MinWithdrawalAmount uint64 `mapstructure:"min_withdrawal_amount"`
+			IntervalSeconds                uint   `mapstructure:"interval_seconds"`
+			BatchSize                      uint   `mapstructure:"batch_size"`
+			MinWithdrawalAmount            uint64 `mapstructure:"min_withdrawal_amount"`
+			MaxWithdrawalsPerAddressPerDay uint64 `mapstructure:"max_withdrawals_per_address_per_day"`
 		} `mapstructure:"sync_withdrawal_requests"`
 		ProcessWithdrawalRequests struct {
 			IntervalSeconds uint   `mapstructure:"interval_seconds"`

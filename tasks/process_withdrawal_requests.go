@@ -46,6 +46,7 @@ var ErrWithdrawalRequestTaskFeeNotEnough = NewWithdrawalRequestError("withdrawal
 var ErrWithdrawalRequestBeneficialAddressInvalid = NewWithdrawalRequestError("withdrawal request beneficial address is invalid")
 var ErrWithdrawalRequestAmountTooSmall = NewWithdrawalRequestError("withdrawal request amount is too small")
 var ErrWithdrawalRequestTransactionUnconfirmedTimeout = NewWithdrawalRequestError("withdrawal request transaction remains unconfirmed after timeout")
+var ErrWithdrawalRequestDailyLimitExceeded = NewWithdrawalRequestError("withdrawal request count exceeds daily limit per address")
 
 func parseWithdrawalAmount(amountText string) (*big.Int, error) {
 	amount, ok := big.NewInt(0).SetString(amountText, 10)
@@ -253,6 +254,10 @@ func checkWithdrawalRequests(ctx context.Context, db *gorm.DB, requests []relay_
 		}
 	}
 
+	if err := checkWithdrawalDailyLimit(db, requests); err != nil {
+		return err
+	}
+
 	for _, request := range requests {
 		ba, err := blockchain.GetBenefitAddress(ctx, common.HexToAddress(request.Address), request.Network)
 		if err != nil {
@@ -263,6 +268,65 @@ func checkWithdrawalRequests(ctx context.Context, db *gorm.DB, requests []relay_
 		}
 	}
 
+	return nil
+}
+
+// checkWithdrawalDailyLimit verifies that accepting the batch would not push any
+// address over the configured per-address daily withdrawal count. The count is
+// based on the wallet's own record creation time (UTC day) and excludes
+// withdrawals that ended up failed or rejected. Requests already stored locally
+// are excluded from the stored count so a re-synced batch is not counted twice.
+func checkWithdrawalDailyLimit(db *gorm.DB, requests []relay_api.WithdrawalRequest) error {
+	limit := config.GetConfig().Tasks.SyncWithdrawalRequests.MaxWithdrawalsPerAddressPerDay
+
+	batchCounts := make(map[string]uint64)
+	remoteIDs := make([]uint, 0, len(requests))
+	for _, request := range requests {
+		batchCounts[request.Address]++
+		remoteIDs = append(remoteIDs, request.ID)
+	}
+
+	addresses := make([]string, 0, len(batchCounts))
+	for address := range batchCounts {
+		addresses = append(addresses, address)
+	}
+
+	now := time.Now().UTC()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+
+	var storedCounts []struct {
+		Address string
+		Count   uint64
+	}
+	if err := db.Model(&models.WithdrawRecord{}).
+		Select("address, COUNT(*) AS count").
+		Where("address IN (?)", addresses).
+		Where("created_at >= ?", dayStart).
+		Where("status NOT IN (?)", []models.WithdrawStatus{models.WithdrawStatusFailed, models.WithdrawStatusFinishedRejected}).
+		Where("remote_id NOT IN (?)", remoteIDs).
+		Group("address").
+		Find(&storedCounts).Error; err != nil {
+		return err
+	}
+
+	totalCounts := make(map[string]uint64, len(batchCounts))
+	for address, count := range batchCounts {
+		totalCounts[address] = count
+	}
+	for _, storedCount := range storedCounts {
+		totalCounts[storedCount.Address] += storedCount.Count
+	}
+
+	for address, count := range totalCounts {
+		if count > limit {
+			log.WithFields(log.Fields{
+				"address":     address,
+				"total_count": count,
+				"limit":       limit,
+			}).Error("Withdrawal daily limit exceeded")
+			return ErrWithdrawalRequestDailyLimitExceeded
+		}
+	}
 	return nil
 }
 
@@ -353,7 +417,7 @@ func syncWithdrawalRequests(ctx context.Context, intervalSeconds uint) error {
 
 func getUnfinishedWithdrawalRecords(ctx context.Context, db *gorm.DB, startID uint, limit int) ([]*models.WithdrawRecord, error) {
 	var records []*models.WithdrawRecord
-	err := db.WithContext(ctx).Where("status != ?", models.WithdrawStatusFinished).Where("id > ?", startID).Order("id ASC").Limit(limit).Find(&records).Error
+	err := db.WithContext(ctx).Where("status NOT IN (?)", []models.WithdrawStatus{models.WithdrawStatusFinished, models.WithdrawStatusFinishedRejected}).Where("id > ?", startID).Order("id ASC").Limit(limit).Find(&records).Error
 	if err != nil {
 		return nil, err
 	}
@@ -488,7 +552,7 @@ func processWithdrawalRecord(ctx context.Context, db *gorm.DB, record *models.Wi
 		if err != nil {
 			return err
 		}
-		if err = record.UpdateStatus(ctx, db, models.WithdrawStatusFinished); err != nil {
+		if err = record.UpdateStatus(ctx, db, models.WithdrawStatusFinishedRejected); err != nil {
 			return err
 		}
 		logWithdrawalRecordFailed(record, fmt.Errorf("withdrawal request blockchain transaction ended with status %d", blockchainTransaction.Status), blockchainTransaction)
@@ -523,7 +587,7 @@ func rejectTimeoutWithdrawalRequest(ctx context.Context, db *gorm.DB, record *mo
 		log.Errorf("ProcessWithdrawalRecords: reject timeout withdrawal record %d error %v", record.ID, err)
 		return err
 	}
-	if err := record.UpdateStatus(ctx, db, models.WithdrawStatusFinished); err != nil {
+	if err := record.UpdateStatus(ctx, db, models.WithdrawStatusFinishedRejected); err != nil {
 		log.Errorf("ProcessWithdrawalRecords: update timeout withdrawal record %d status error %v", record.ID, err)
 		return err
 	}

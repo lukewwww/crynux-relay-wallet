@@ -73,6 +73,7 @@ tasks:
     interval_seconds: 5
     batch_size: 100
     min_withdrawal_amount: 1
+    max_withdrawals_per_address_per_day: 10
   process_withdrawal_requests:
     interval_seconds: 5
     batch_size: 10

@@ -36,6 +36,7 @@ The wallet MUST enforce all rules below before storing a request:
 - Request status MUST be `pending`.
 - Every request address in the batch MUST already exist in local `relay_accounts`.
 - Aggregated per-address withdrawal amount in the batch MUST NOT exceed local account balance.
+- Accepting the batch MUST NOT push any address over the configured `max_withdrawals_per_address_per_day` count for the current UTC day. The count is the number of local `withdraw_records` for the address created in the current UTC day, measured by the wallet's own record creation time, excluding records with status `failed` or `finished-rejected` and excluding records whose remote ID is part of the current batch, plus the number of requests for the address in the current batch. Relay-reported request timestamps MUST NOT be used for this count.
 - Benefit address fetched from chain (`GetBenefitAddress`) MUST equal request `benefit_address`.
 
 System wallet token and gas balances MUST NOT be validated during request synchronization. Insufficient system wallet balance SHALL be handled during blockchain transaction sending.
@@ -46,10 +47,12 @@ Validation failure SHALL fail the sync attempt.
 
 The wallet stores each accepted request as `withdraw_records` with local status lifecycle:
 
-- `pending` -> `success` or `failed` -> `finished`
+- `pending` -> `success` -> `finished`
+- `pending` -> `failed` -> `finished-rejected`
 
 `success` and `failed` represent local execution outcome before relay callback completion.
-`finished` represents callback completion (`fulfill` or `reject`) and local finalization.
+`finished` represents `fulfill` callback completion and local finalization.
+`finished-rejected` represents `reject` callback completion and local finalization. The two terminal statuses MUST remain distinct so that rejected withdrawals can be excluded from the per-address daily withdrawal count.
 
 Each local withdrawal record MUST store the withdrawal fee reported by Relay. All wallet-side balance validation and debit rules MUST use `amount + withdrawal_fee`, because Relay charges the requester relay account by that same total amount when creating the `Withdraw` ledger event.
 
@@ -74,9 +77,8 @@ For the active unfinished local record:
    - Update record status to `success` in the same transaction.
 6. If failed and retries are exhausted, or if cancelled before broadcast, update record status to `failed`.
 7. After leaving pending loop:
-   - If status is `success`, call Relay `FulfillWithdrawalRequest` with tx hash.
-   - Otherwise call Relay `RejectWithdrawalRequest`.
-8. Set local record status to `finished`.
+   - If status is `success`, call Relay `FulfillWithdrawalRequest` with tx hash and set local record status to `finished`.
+   - Otherwise call Relay `RejectWithdrawalRequest` and set local record status to `finished-rejected`.
 
 ## Dynamic Fee Estimation and Sending
 
@@ -130,8 +132,8 @@ Each record processing attempt SHALL run with a per-record deadline:
 
 If deadline is exceeded:
 
-- If no blockchain transaction is attached, call Relay `RejectWithdrawalRequest` and set local status to `finished`.
-- If the current blockchain transaction is `pending` and has no `tx_hash`, atomically change it to `cancelled`, call Relay `RejectWithdrawalRequest`, and set local status to `finished`.
+- If no blockchain transaction is attached, call Relay `RejectWithdrawalRequest` and set local status to `finished-rejected`.
+- If the current blockchain transaction is `pending` and has no `tx_hash`, atomically change it to `cancelled`, call Relay `RejectWithdrawalRequest`, and set local status to `finished-rejected`.
 - If the current blockchain transaction has been broadcast or is otherwise not cancellable and has not reached a terminal state at timeout handling time, do not reject the Relay withdrawal and do not continue waiting. Log the blocking transaction context, return timeout error for the alerting path, and stop processing later withdrawal records.
 - If the current blockchain transaction reached a terminal local state before timeout handling, resume normal finalization from that terminal state. This covers recovery after processor interruption; it is not a continued wait past the withdrawal deadline.
 

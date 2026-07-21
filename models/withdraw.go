@@ -27,6 +27,7 @@ const (
 	WithdrawStatusSuccess
 	WithdrawStatusFailed
 	WithdrawStatusFinished
+	WithdrawStatusFinishedRejected
 )
 
 func (w *WithdrawRecord) UpdateStatus(ctx context.Context, db *gorm.DB, status WithdrawStatus) error {
