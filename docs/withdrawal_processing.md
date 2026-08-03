@@ -37,7 +37,10 @@ The wallet MUST enforce all rules below before storing a request:
 - Request status MUST be `pending`.
 - Every request address in the batch MUST already exist in local `relay_accounts`.
 - Aggregated per-address withdrawal amount in the batch MUST NOT exceed local account balance.
-- Accepting the batch MUST NOT push any address over the configured `max_withdrawals_per_address_per_day` count for the current UTC day. The count is the number of local `withdraw_records` for the address created in the current UTC day, measured by the wallet's own record creation time, excluding records with status `failed` or `finished-rejected` and excluding records whose remote ID is part of the current batch, plus the number of requests for the address in the current batch. Relay-reported request timestamps MUST NOT be used for this count.
+- Every blockchain configuration MUST define `max_withdrawals_per_day` greater than `0`. The configured value MUST equal the Relay limit for the same funding network.
+- Accepting the batch MUST NOT push either a requester address or a destination benefit address over the target network's configured `max_withdrawals_per_day`. Requester and benefit-address counts MUST be maintained independently and isolated by network.
+- Each daily count is the number of matching local `withdraw_records` for the network created in the current UTC day, measured by the wallet's own record creation time, excluding records with status `failed` or `finished-rejected` and excluding records whose remote ID is part of the current batch, plus matching requests in the current batch. Relay-reported request timestamps MUST NOT be used for this count.
+- A request whose network is not configured by Relay Wallet MUST fail validation.
 - Benefit address fetched from chain (`GetBenefitAddress`) MUST equal request `benefit_address`.
 
 System wallet token and gas balances MUST NOT be validated during request synchronization. Insufficient system wallet balance SHALL be handled during blockchain transaction sending.
@@ -53,7 +56,7 @@ The wallet stores each accepted request as `withdraw_records` with local status 
 
 `success` and `failed` represent local execution outcome before relay callback completion.
 `finished` represents `fulfill` callback completion and local finalization.
-`finished-rejected` represents `reject` callback completion and local finalization. The two terminal statuses MUST remain distinct so that rejected withdrawals can be excluded from the per-address daily withdrawal count.
+`finished-rejected` represents `reject` callback completion and local finalization. The two terminal statuses MUST remain distinct so that rejected withdrawals can be excluded from requester and benefit-address daily withdrawal counts.
 
 Each local withdrawal record MUST store the withdrawal fee reported by Relay. All wallet-side balance validation and debit rules MUST use `amount + withdrawal_fee`, because Relay charges the requester relay account by that same total amount when creating the `Withdraw` ledger event.
 Each local withdrawal record MUST also store the Relay-supplied timestamp and signature. A cryptographically valid authorization MUST store its unique authorization fingerprint. Historical rows remain nullable; a historical row without committed broadcast evidence and without valid authorization MUST follow `failed` -> `finished-rejected`.

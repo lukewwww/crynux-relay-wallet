@@ -62,7 +62,9 @@ Alerts:
 2) Daily system-wide cap
    - The aggregate daily payout limit is effectively enforced by limiting funds kept in the system wallet; no extra mechanism is added here.
 
-3) Per-address withdrawal rate limits
-   - The wallet enforces a per-address daily withdrawal count limit (`max_withdrawals_per_address_per_day`) during request synchronization, independently from the equivalent limit enforced by the Relay. The count uses the wallet's own record creation time within the current UTC day and excludes failed and rejected withdrawals. A breach means the Relay-side limit was bypassed or the two configurations diverge, so the wallet halts withdrawal request synchronization and alerts operators.
+3) Per-network withdrawal rate limits
+   - Every configured blockchain carries its own `max_withdrawals_per_day`. This includes blockchains used by nodes and fund-only blockchains.
+   - During request synchronization, the wallet independently enforces that network's limit for both the requester address and the destination benefit address. Counts are isolated by network, use the wallet's own record creation time within the current UTC day, and exclude failed and rejected withdrawals.
+   - Wallet limit values must equal the Relay limits for the same funding network. A breach means the Relay-side limit was bypassed or the configurations diverge, so the wallet halts withdrawal request synchronization and alerts operators.
 
 See System Architecture for details: [docs/architecture.md](./docs/architecture.md)

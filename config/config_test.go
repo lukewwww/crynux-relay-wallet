@@ -53,6 +53,7 @@ blockchains:
     token_type: native
     gas_limit_buffer_percent: 20
     receipt_confirmation_blocks: 1
+    max_withdrawals_per_day: 10
     contracts:
       benefit_address: "0x0000000000000000000000000000000000000001"
     account:
@@ -63,6 +64,7 @@ blockchains:
     token_address: "0x0000000000000000000000000000000000000002"
     gas_limit_buffer_percent: 20
     receipt_confirmation_blocks: 1
+    max_withdrawals_per_day: 20
     contracts:
       benefit_address: "0x0000000000000000000000000000000000000003"
     account:
@@ -87,6 +89,12 @@ tasks:
 	}
 	if cfg.Blockchains["network_b"].Account.PrivateKey != networkBKey {
 		t.Fatalf("network_b private key mismatch")
+	}
+	if cfg.Blockchains["network_a"].MaxWithdrawalsPerDay != 10 {
+		t.Fatalf("network_a max withdrawals per day mismatch")
+	}
+	if cfg.Blockchains["network_b"].MaxWithdrawalsPerDay != 20 {
+		t.Fatalf("network_b max withdrawals per day mismatch")
 	}
 	if cfg.Relay.Api.PrivateKey != relayKey {
 		t.Fatalf("relay api private key mismatch")
@@ -114,6 +122,7 @@ blockchains:
     token_type: native
     gas_limit_buffer_percent: 20
     receipt_confirmation_blocks: 1
+    max_withdrawals_per_day: 10
     contracts:
       benefit_address: "0x0000000000000000000000000000000000000001"
     account:
@@ -123,6 +132,7 @@ blockchains:
     token_type: native
     gas_limit_buffer_percent: 20
     receipt_confirmation_blocks: 1
+    max_withdrawals_per_day: 10
     contracts:
       benefit_address: "0x0000000000000000000000000000000000000002"
     account:
@@ -223,5 +233,27 @@ tasks:
 	err := InitConfig(configDir)
 	if err == nil || err.Error() != "blockchain network_a receipt confirmation blocks not set" {
 		t.Fatalf("expected receipt confirmation blocks error, got %v", err)
+	}
+}
+
+func TestInitConfigRequiresMaxWithdrawalsPerDay(t *testing.T) {
+	configDir := t.TempDir()
+	writeConfigFile(t, configDir, `
+environment: test
+blockchains:
+  network_a:
+    token_type: native
+    gas_limit_buffer_percent: 20
+    receipt_confirmation_blocks: 1
+    contracts:
+      benefit_address: "0x0000000000000000000000000000000000000001"
+tasks:
+  process_withdrawal_requests:
+    cancellation_settlement_timeout_seconds: 30
+`)
+
+	err := InitConfig(configDir)
+	if err == nil || err.Error() != "blockchain network_a max withdrawals per day not set" {
+		t.Fatalf("expected max withdrawals per day error, got %v", err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crynux_relay_wallet/config"
 	"crynux_relay_wallet/models"
+	"crynux_relay_wallet/relay_api"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -149,6 +150,148 @@ func createWithdrawalAccount(t *testing.T, db *gorm.DB, address string, balance 
 	}
 	if err := db.Create(account).Error; err != nil {
 		t.Fatalf("save relay account: %v", err)
+	}
+}
+
+func setupWithdrawalDailyLimitTest(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, _ := setupWithdrawalCancellationTest(t)
+	config.GetConfig().Blockchains = map[string]config.BlockchainConfig{
+		"network_a": {MaxWithdrawalsPerDay: 2},
+		"network_b": {MaxWithdrawalsPerDay: 1},
+	}
+	return db
+}
+
+func createDailyLimitWithdrawal(
+	t *testing.T,
+	db *gorm.DB,
+	remoteID uint,
+	network string,
+	address string,
+	benefitAddress string,
+	status models.WithdrawStatus,
+) *models.WithdrawRecord {
+	t.Helper()
+	record := &models.WithdrawRecord{
+		RemoteID:       remoteID,
+		Address:        address,
+		BenefitAddress: benefitAddress,
+		Amount:         models.BigInt{Int: *big.NewInt(1)},
+		WithdrawalFee:  models.BigInt{Int: *big.NewInt(0)},
+		Network:        network,
+		Status:         status,
+	}
+	if err := db.Create(record).Error; err != nil {
+		t.Fatalf("create daily limit withdrawal: %v", err)
+	}
+	return record
+}
+
+func TestCheckWithdrawalDailyLimitIsScopedByNetwork(t *testing.T) {
+	db := setupWithdrawalDailyLimitTest(t)
+	address := "0x1111111111111111111111111111111111111111"
+	benefitAddress := "0x2222222222222222222222222222222222222222"
+	createDailyLimitWithdrawal(t, db, 1, "network_a", address, benefitAddress, models.WithdrawStatusPending)
+	createDailyLimitWithdrawal(t, db, 2, "network_a", address, benefitAddress, models.WithdrawStatusFinished)
+
+	requestOnNetworkB := relay_api.WithdrawalRequest{
+		ID:             3,
+		Network:        "network_b",
+		Address:        address,
+		BenefitAddress: benefitAddress,
+	}
+	if err := checkWithdrawalDailyLimit(db, []relay_api.WithdrawalRequest{requestOnNetworkB}); err != nil {
+		t.Fatalf("different network should have an independent limit: %v", err)
+	}
+	secondRequestOnNetworkB := requestOnNetworkB
+	secondRequestOnNetworkB.ID = 4
+	secondRequestOnNetworkB.Address = "0x3333333333333333333333333333333333333333"
+	if err := checkWithdrawalDailyLimit(db, []relay_api.WithdrawalRequest{requestOnNetworkB, secondRequestOnNetworkB}); !errors.Is(err, ErrWithdrawalRequestDailyLimitExceeded) {
+		t.Fatalf("expected network_b benefit address limit error, got %v", err)
+	}
+
+	requestOnNetworkA := requestOnNetworkB
+	requestOnNetworkA.Network = "network_a"
+	if err := checkWithdrawalDailyLimit(db, []relay_api.WithdrawalRequest{requestOnNetworkA}); !errors.Is(err, ErrWithdrawalRequestDailyLimitExceeded) {
+		t.Fatalf("expected requester daily limit error, got %v", err)
+	}
+}
+
+func TestCheckWithdrawalDailyLimitChecksBenefitAddress(t *testing.T) {
+	db := setupWithdrawalDailyLimitTest(t)
+	benefitAddress := "0x2222222222222222222222222222222222222222"
+	createDailyLimitWithdrawal(t, db, 1, "network_a", "0x1111111111111111111111111111111111111111", benefitAddress, models.WithdrawStatusPending)
+	createDailyLimitWithdrawal(t, db, 2, "network_a", "0x3333333333333333333333333333333333333333", benefitAddress, models.WithdrawStatusFinished)
+
+	request := relay_api.WithdrawalRequest{
+		ID:             3,
+		Network:        "network_a",
+		Address:        "0x4444444444444444444444444444444444444444",
+		BenefitAddress: benefitAddress,
+	}
+	if err := checkWithdrawalDailyLimit(db, []relay_api.WithdrawalRequest{request}); !errors.Is(err, ErrWithdrawalRequestDailyLimitExceeded) {
+		t.Fatalf("expected benefit address daily limit error, got %v", err)
+	}
+}
+
+func TestCheckWithdrawalDailyLimitCountsBatchAndEligibleStatuses(t *testing.T) {
+	db := setupWithdrawalDailyLimitTest(t)
+	address := "0x1111111111111111111111111111111111111111"
+	createDailyLimitWithdrawal(t, db, 1, "network_a", address, "0x2000000000000000000000000000000000000001", models.WithdrawStatusPending)
+	createDailyLimitWithdrawal(t, db, 2, "network_a", address, "0x2000000000000000000000000000000000000002", models.WithdrawStatusFailed)
+	createDailyLimitWithdrawal(t, db, 3, "network_a", address, "0x2000000000000000000000000000000000000003", models.WithdrawStatusFinishedRejected)
+
+	requests := []relay_api.WithdrawalRequest{
+		{ID: 1, Network: "network_a", Address: address, BenefitAddress: "0x3000000000000000000000000000000000000001"},
+		{ID: 4, Network: "network_a", Address: address, BenefitAddress: "0x3000000000000000000000000000000000000002"},
+	}
+	if err := checkWithdrawalDailyLimit(db, requests); err != nil {
+		t.Fatalf("failed, rejected, and re-synced rows should be excluded: %v", err)
+	}
+
+	createDailyLimitWithdrawal(t, db, 5, "network_a", address, "0x2000000000000000000000000000000000000005", models.WithdrawStatusSuccess)
+	if err := checkWithdrawalDailyLimit(db, requests); !errors.Is(err, ErrWithdrawalRequestDailyLimitExceeded) {
+		t.Fatalf("expected batch daily limit error, got %v", err)
+	}
+}
+
+func TestCheckWithdrawalDailyLimitUsesCurrentUTCDay(t *testing.T) {
+	db := setupWithdrawalDailyLimitTest(t)
+	address := "0x1111111111111111111111111111111111111111"
+	oldRecord := createDailyLimitWithdrawal(
+		t,
+		db,
+		1,
+		"network_a",
+		address,
+		"0x2000000000000000000000000000000000000001",
+		models.WithdrawStatusPending,
+	)
+	previousDay := time.Now().UTC().Add(-24 * time.Hour)
+	if err := db.Model(oldRecord).UpdateColumn("created_at", previousDay).Error; err != nil {
+		t.Fatalf("move withdrawal to previous UTC day: %v", err)
+	}
+
+	requests := []relay_api.WithdrawalRequest{
+		{ID: 2, Network: "network_a", Address: address, BenefitAddress: "0x3000000000000000000000000000000000000001"},
+		{ID: 3, Network: "network_a", Address: address, BenefitAddress: "0x3000000000000000000000000000000000000002"},
+	}
+	if err := checkWithdrawalDailyLimit(db, requests); err != nil {
+		t.Fatalf("previous UTC day should not count toward the limit: %v", err)
+	}
+}
+
+func TestCheckWithdrawalDailyLimitRejectsUnknownNetwork(t *testing.T) {
+	db := setupWithdrawalDailyLimitTest(t)
+	request := relay_api.WithdrawalRequest{
+		ID:             1,
+		Network:        "unknown",
+		Address:        "0x1111111111111111111111111111111111111111",
+		BenefitAddress: "0x2222222222222222222222222222222222222222",
+	}
+	if err := checkWithdrawalDailyLimit(db, []relay_api.WithdrawalRequest{request}); !errors.Is(err, ErrWithdrawalRequestNetworkInvalid) {
+		t.Fatalf("expected invalid network error, got %v", err)
 	}
 }
 

@@ -93,6 +93,9 @@ func checkBlockchainAccount() error {
 		if blockchain.ReceiptConfirmationBlocks == 0 {
 			return fmt.Errorf("blockchain %s receipt confirmation blocks not set", network)
 		}
+		if blockchain.MaxWithdrawalsPerDay == 0 {
+			return fmt.Errorf("blockchain %s max withdrawals per day not set", network)
+		}
 		if blockchain.Account.PrivateKey == "" {
 			return errors.New("blockchain account private key not set")
 		}

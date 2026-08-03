@@ -50,7 +50,8 @@ var ErrWithdrawalRequestTaskFeeNotEnough = NewWithdrawalRequestError("withdrawal
 var ErrWithdrawalRequestBeneficialAddressInvalid = NewWithdrawalRequestError("withdrawal request beneficial address is invalid")
 var ErrWithdrawalRequestAmountTooSmall = NewWithdrawalRequestError("withdrawal request amount is too small")
 var ErrWithdrawalRequestTransactionUnconfirmedTimeout = NewWithdrawalRequestError("withdrawal request transaction remains unconfirmed after timeout")
-var ErrWithdrawalRequestDailyLimitExceeded = NewWithdrawalRequestError("withdrawal request count exceeds daily limit per address")
+var ErrWithdrawalRequestDailyLimitExceeded = NewWithdrawalRequestError("withdrawal request count exceeds daily limit for network and address")
+var ErrWithdrawalRequestNetworkInvalid = NewWithdrawalRequestError("withdrawal request network is invalid")
 var ErrWithdrawalAuthorizationMissing = errors.New("withdrawal authorization is missing")
 var ErrWithdrawalAuthorizationInvalid = errors.New("withdrawal authorization is invalid")
 var ErrWithdrawalAuthorizationAddressMismatch = errors.New("withdrawal authorization address mismatch")
@@ -376,58 +377,105 @@ func checkWithdrawalRequests(ctx context.Context, db *gorm.DB, requests []relay_
 	return nil
 }
 
-// checkWithdrawalDailyLimit verifies that accepting the batch would not push any
-// address over the configured per-address daily withdrawal count. The count is
-// based on the wallet's own record creation time (UTC day) and excludes
-// withdrawals that ended up failed or rejected. Requests already stored locally
-// are excluded from the stored count so a re-synced batch is not counted twice.
-func checkWithdrawalDailyLimit(db *gorm.DB, requests []relay_api.WithdrawalRequest) error {
-	limit := config.GetConfig().Tasks.SyncWithdrawalRequests.MaxWithdrawalsPerAddressPerDay
+type withdrawalDailyLimitKey struct {
+	Network string
+	Address string
+}
 
-	batchCounts := make(map[string]uint64)
+// checkWithdrawalDailyLimit verifies the requester and destination limits for
+// every network represented in the batch.
+func checkWithdrawalDailyLimit(db *gorm.DB, requests []relay_api.WithdrawalRequest) error {
+	if len(requests) == 0 {
+		return nil
+	}
+
+	appConfig := config.GetConfig()
+	requesterCounts := make(map[withdrawalDailyLimitKey]uint64)
+	benefitCounts := make(map[withdrawalDailyLimitKey]uint64)
+	limits := make(map[string]uint64)
+	networkSet := make(map[string]struct{})
+	addressSet := make(map[string]struct{})
+	benefitAddressSet := make(map[string]struct{})
 	remoteIDs := make([]uint, 0, len(requests))
 	for _, request := range requests {
-		batchCounts[request.Address]++
+		blockchainConfig, ok := appConfig.Blockchains[request.Network]
+		if !ok || blockchainConfig.MaxWithdrawalsPerDay == 0 {
+			return ErrWithdrawalRequestNetworkInvalid
+		}
+		limits[request.Network] = blockchainConfig.MaxWithdrawalsPerDay
+		networkSet[request.Network] = struct{}{}
+		addressSet[request.Address] = struct{}{}
+		benefitAddressSet[request.BenefitAddress] = struct{}{}
+		requesterCounts[withdrawalDailyLimitKey{Network: request.Network, Address: request.Address}]++
+		benefitCounts[withdrawalDailyLimitKey{Network: request.Network, Address: request.BenefitAddress}]++
 		remoteIDs = append(remoteIDs, request.ID)
 	}
 
-	addresses := make([]string, 0, len(batchCounts))
-	for address := range batchCounts {
+	networks := make([]string, 0, len(networkSet))
+	for network := range networkSet {
+		networks = append(networks, network)
+	}
+	addresses := make([]string, 0, len(addressSet))
+	for address := range addressSet {
 		addresses = append(addresses, address)
+	}
+	benefitAddresses := make([]string, 0, len(benefitAddressSet))
+	for address := range benefitAddressSet {
+		benefitAddresses = append(benefitAddresses, address)
 	}
 
 	now := time.Now().UTC()
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 
-	var storedCounts []struct {
-		Address string
-		Count   uint64
+	var storedRecords []struct {
+		Network        string
+		Address        string
+		BenefitAddress string
 	}
-	if err := db.Model(&models.WithdrawRecord{}).
-		Select("address, COUNT(*) AS count").
-		Where("address IN (?)", addresses).
+	query := db.Model(&models.WithdrawRecord{}).
+		Select("network, address, benefit_address").
+		Where("network IN (?)", networks).
+		Where("(address IN (?) OR benefit_address IN (?))", addresses, benefitAddresses).
 		Where("created_at >= ?", dayStart).
-		Where("status NOT IN (?)", []models.WithdrawStatus{models.WithdrawStatusFailed, models.WithdrawStatusFinishedRejected}).
-		Where("remote_id NOT IN (?)", remoteIDs).
-		Group("address").
-		Find(&storedCounts).Error; err != nil {
+		Where("status NOT IN (?)", []models.WithdrawStatus{models.WithdrawStatusFailed, models.WithdrawStatusFinishedRejected})
+	if len(remoteIDs) > 0 {
+		query = query.Where("remote_id NOT IN (?)", remoteIDs)
+	}
+	if err := query.Find(&storedRecords).Error; err != nil {
 		return err
 	}
 
-	totalCounts := make(map[string]uint64, len(batchCounts))
-	for address, count := range batchCounts {
-		totalCounts[address] = count
-	}
-	for _, storedCount := range storedCounts {
-		totalCounts[storedCount.Address] += storedCount.Count
+	for _, record := range storedRecords {
+		requesterKey := withdrawalDailyLimitKey{Network: record.Network, Address: record.Address}
+		if _, ok := requesterCounts[requesterKey]; ok {
+			requesterCounts[requesterKey]++
+		}
+		benefitKey := withdrawalDailyLimitKey{Network: record.Network, Address: record.BenefitAddress}
+		if _, ok := benefitCounts[benefitKey]; ok {
+			benefitCounts[benefitKey]++
+		}
 	}
 
-	for address, count := range totalCounts {
+	if err := checkWithdrawalDailyLimitCounts("requester", requesterCounts, limits); err != nil {
+		return err
+	}
+	return checkWithdrawalDailyLimitCounts("benefit", benefitCounts, limits)
+}
+
+func checkWithdrawalDailyLimitCounts(
+	addressType string,
+	counts map[withdrawalDailyLimitKey]uint64,
+	limits map[string]uint64,
+) error {
+	for key, count := range counts {
+		limit := limits[key.Network]
 		if count > limit {
 			log.WithFields(log.Fields{
-				"address":     address,
-				"total_count": count,
-				"limit":       limit,
+				"network":      key.Network,
+				"address":      key.Address,
+				"address_type": addressType,
+				"total_count":  count,
+				"limit":        limit,
 			}).Error("Withdrawal daily limit exceeded")
 			return ErrWithdrawalRequestDailyLimitExceeded
 		}

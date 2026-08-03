@@ -329,6 +329,7 @@ blockchains:
     receipt_wait_time: 30
     receipt_confirmation_blocks: 1
     sent_transaction_count_limit: 100
+    max_withdrawals_per_day: 10
 relay:
   api:
     private_key_file: %s

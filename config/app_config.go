@@ -11,6 +11,32 @@ const (
 	TokenTypeERC20  = "erc20"
 )
 
+type BlockchainConfig struct {
+	RPS                   uint64 `mapstructure:"rps"`
+	RpcEndpoint           string `mapstructure:"rpc_endpoint"`
+	TokenType             string `mapstructure:"token_type"`
+	TokenAddress          string `mapstructure:"token_address"`
+	GasLimit              uint64 `mapstructure:"gas_limit"`
+	GasLimitBufferPercent uint64 `mapstructure:"gas_limit_buffer_percent"`
+	MaxFeePerGas          uint64 `mapstructure:"max_fee_per_gas"`
+	MaxPriorityFeePerGas  uint64 `mapstructure:"max_priority_fee_per_gas"`
+	ChainID               uint64 `mapstructure:"chain_id"`
+	Account               struct {
+		Address        string `mapstructure:"address"`
+		PrivateKey     string `mapstructure:"private_key"`
+		PrivateKeyFile string `mapstructure:"private_key_file"`
+	} `mapstructure:"account"`
+	Contracts struct {
+		BenefitAddress string `mapstructure:"benefit_address"`
+	} `mapstructure:"contracts"`
+	MaxRetries                uint8  `mapstructure:"max_retries"`
+	RetryInterval             uint64 `mapstructure:"retry_interval"`
+	ReceiptWaitTime           uint64 `mapstructure:"receipt_wait_time"`
+	ReceiptConfirmationBlocks uint64 `mapstructure:"receipt_confirmation_blocks"`
+	SentTransactionCountLimit uint64 `mapstructure:"sent_transaction_count_limit"`
+	MaxWithdrawalsPerDay      uint64 `mapstructure:"max_withdrawals_per_day"`
+}
+
 type AppConfig struct {
 	Environment string `mapstructure:"environment"`
 
@@ -36,30 +62,7 @@ type AppConfig struct {
 		AlertLogFile     string `mapstructure:"alert_log_file"`
 	} `mapstructure:"log"`
 
-	Blockchains map[string]struct {
-		RPS                   uint64 `mapstructure:"rps"`
-		RpcEndpoint           string `mapstructure:"rpc_endpoint"`
-		TokenType             string `mapstructure:"token_type"`
-		TokenAddress          string `mapstructure:"token_address"`
-		GasLimit              uint64 `mapstructure:"gas_limit"`
-		GasLimitBufferPercent uint64 `mapstructure:"gas_limit_buffer_percent"`
-		MaxFeePerGas          uint64 `mapstructure:"max_fee_per_gas"`
-		MaxPriorityFeePerGas  uint64 `mapstructure:"max_priority_fee_per_gas"`
-		ChainID               uint64 `mapstructure:"chain_id"`
-		Account               struct {
-			Address        string `mapstructure:"address"`
-			PrivateKey     string `mapstructure:"private_key"`
-			PrivateKeyFile string `mapstructure:"private_key_file"`
-		} `mapstructure:"account"`
-		Contracts struct {
-			BenefitAddress string `mapstructure:"benefit_address"`
-		} `mapstructure:"contracts"`
-		MaxRetries                uint8  `mapstructure:"max_retries"`
-		RetryInterval             uint64 `mapstructure:"retry_interval"`
-		ReceiptWaitTime           uint64 `mapstructure:"receipt_wait_time"`
-		ReceiptConfirmationBlocks uint64 `mapstructure:"receipt_confirmation_blocks"`
-		SentTransactionCountLimit uint64 `mapstructure:"sent_transaction_count_limit"`
-	} `mapstructure:"blockchains"`
+	Blockchains map[string]BlockchainConfig `mapstructure:"blockchains"`
 
 	Relay struct {
 		Api struct {
@@ -82,10 +85,9 @@ type AppConfig struct {
 			DepositMaxAgeSeconds       uint64 `mapstructure:"deposit_max_age_seconds"`
 		} `mapstructure:"sync_task_fee_logs"`
 		SyncWithdrawalRequests struct {
-			IntervalSeconds                uint   `mapstructure:"interval_seconds"`
-			BatchSize                      uint   `mapstructure:"batch_size"`
-			MinWithdrawalAmount            uint64 `mapstructure:"min_withdrawal_amount"`
-			MaxWithdrawalsPerAddressPerDay uint64 `mapstructure:"max_withdrawals_per_address_per_day"`
+			IntervalSeconds     uint   `mapstructure:"interval_seconds"`
+			BatchSize           uint   `mapstructure:"batch_size"`
+			MinWithdrawalAmount uint64 `mapstructure:"min_withdrawal_amount"`
 		} `mapstructure:"sync_withdrawal_requests"`
 		ProcessWithdrawalRequests struct {
 			IntervalSeconds                      uint   `mapstructure:"interval_seconds"`

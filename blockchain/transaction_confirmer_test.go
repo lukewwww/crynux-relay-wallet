@@ -60,6 +60,7 @@ blockchains:
     token_type: native
     gas_limit_buffer_percent: 20
     receipt_confirmation_blocks: 1
+    max_withdrawals_per_day: 10
     retry_interval: 1
     max_retries: 3
     contracts:
