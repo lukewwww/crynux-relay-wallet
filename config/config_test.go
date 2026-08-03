@@ -204,11 +204,12 @@ func TestInitConfigRequiresCancellationSettlementTimeout(t *testing.T) {
 	}
 }
 
-func TestInitConfigRequiresReceiptConfirmationBlocks(t *testing.T) {
+func TestInitConfigAcceptsZeroReceiptConfirmationBlocks(t *testing.T) {
 	configDir := t.TempDir()
 	networkKey, networkAddress := generateAccount(t)
+	relayKey, _ := generateAccount(t)
 	networkPath := writePrivateKeyFile(t, configDir, "network_privkey.txt", networkKey)
-	relayPath := writePrivateKeyFile(t, configDir, "relay_api_privkey.txt", networkKey)
+	relayPath := writePrivateKeyFile(t, configDir, "relay_api_privkey.txt", relayKey)
 
 	configContent := fmt.Sprintf(`
 environment: debug
@@ -216,6 +217,8 @@ blockchains:
   network_a:
     token_type: native
     gas_limit_buffer_percent: 20
+    receipt_confirmation_blocks: 0
+    max_withdrawals_per_day: 10
     contracts:
       benefit_address: "0x0000000000000000000000000000000000000001"
     account:
@@ -230,9 +233,11 @@ tasks:
 `, networkAddress, filepath.ToSlash(networkPath), filepath.ToSlash(relayPath))
 	writeConfigFile(t, configDir, configContent)
 
-	err := InitConfig(configDir)
-	if err == nil || err.Error() != "blockchain network_a receipt confirmation blocks not set" {
-		t.Fatalf("expected receipt confirmation blocks error, got %v", err)
+	if err := InitConfig(configDir); err != nil {
+		t.Fatalf("InitConfig failed: %v", err)
+	}
+	if GetConfig().Blockchains["network_a"].ReceiptConfirmationBlocks != 0 {
+		t.Fatalf("expected receipt confirmation blocks 0, got %d", GetConfig().Blockchains["network_a"].ReceiptConfirmationBlocks)
 	}
 }
 

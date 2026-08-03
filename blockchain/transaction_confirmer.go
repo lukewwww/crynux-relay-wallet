@@ -300,9 +300,6 @@ func (tc *TransactionConfirmer) handleDelayedReceipt(ctx context.Context, transa
 }
 
 func receiptHasRequiredConfirmations(latestBlock, receiptBlock, required uint64) bool {
-	if required == 0 {
-		return false
-	}
 	if latestBlock < receiptBlock {
 		return false
 	}

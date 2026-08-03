@@ -148,8 +148,11 @@ func TestReceiptHasRequiredConfirmations(t *testing.T) {
 	if receiptHasRequiredConfirmations(99, 100, 1) {
 		t.Fatal("reorg below receipt block must wait")
 	}
-	if receiptHasRequiredConfirmations(200, 100, 0) {
-		t.Fatal("required zero must never confirm")
+	if !receiptHasRequiredConfirmations(100, 100, 0) {
+		t.Fatal("required zero must confirm at receipt block")
+	}
+	if receiptHasRequiredConfirmations(99, 100, 0) {
+		t.Fatal("required zero must still wait when latest is below receipt block")
 	}
 }
 
