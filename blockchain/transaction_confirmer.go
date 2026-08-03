@@ -2,6 +2,7 @@ package blockchain
 
 import (
 	"context"
+	"crynux_relay_wallet/alert"
 	"crynux_relay_wallet/config"
 	"crynux_relay_wallet/models"
 	"errors"
@@ -117,7 +118,8 @@ func (tc *TransactionConfirmer) getSentTransactions(ctx context.Context) {
 				continue
 			}
 			var cnt int
-			for _, transaction := range transactions {
+			for i := range transactions {
+				transaction := transactions[i]
 				_, loaded := tc.processingTxs.LoadOrStore(transaction.ID, struct{}{})
 				if !loaded {
 					select {
@@ -136,14 +138,14 @@ func (tc *TransactionConfirmer) getSentTransactions(ctx context.Context) {
 func (tc *TransactionConfirmer) processSentTransactions(ctx context.Context) {
 	for transaction := range tc.txQueue {
 		tc.limiter <- struct{}{}
-		go func() {
+		go func(transaction *models.BlockchainTransaction) {
 			defer func() {
 				<-tc.limiter
 			}()
 			if err := tc.confirmTransaction(ctx, transaction); err != nil {
 				log.Errorf("Failed to confirm transaction %d: %v", transaction.ID, err)
 			}
-		}()
+		}(transaction)
 	}
 }
 
@@ -173,41 +175,51 @@ func (tc *TransactionConfirmer) confirmTransaction(ctx context.Context, transact
 		return err
 	}
 
-	waitDeadline := transaction.SentAt.Time.Add(time.Duration(blockchain.ReceiptWaitTime) * time.Second)
-	if time.Now().After(waitDeadline) {
-		log.Warnf("Transaction %d has waited too long for receipt", transaction.ID)
-		if err := tc.handleTimedOutTransaction(ctx, client, transaction); err != nil {
-			log.Errorf("Failed to handle timed out transaction: %v", err)
-			return err
-		}
-		return nil
-	}
-
 	txHash := common.HexToHash(transaction.TxHash.String)
-
-	// Get transaction receipt
 	receipt, err := client.RpcClient.TransactionReceipt(ctx, txHash)
 	if err != nil {
-		// If transaction is not found, it might still be pending
 		if errors.Is(err, ethereum.NotFound) {
+			waitDeadline := transaction.SentAt.Time.Add(time.Duration(blockchain.ReceiptWaitTime) * time.Second)
+			if time.Now().After(waitDeadline) {
+				return tc.handleDelayedReceipt(ctx, transaction)
+			}
 			log.Debugf("Transaction %s is still pending", txHash.Hex())
 			return nil
 		}
-
-		// If there's a timeout or other error, mark as failed
 		log.Errorf("Error getting receipt for transaction %s: %v", txHash.Hex(), err)
 		return err
 	}
 
-	// Check transaction status
+	if receipt.BlockNumber == nil {
+		return fmt.Errorf("transaction %d receipt has no block number", transaction.ID)
+	}
+
+	latestHeader, err := client.RpcClient.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if latestHeader == nil || latestHeader.Number == nil {
+		return fmt.Errorf("latest block header unavailable for network %s", transaction.Network)
+	}
+
+	requiredConfirmations := blockchain.ReceiptConfirmationBlocks
+	if !receiptHasRequiredConfirmations(latestHeader.Number.Uint64(), receipt.BlockNumber.Uint64(), requiredConfirmations) {
+		log.Debugf(
+			"Transaction %d receipt waiting for confirmations: latest=%d receipt_block=%d need=%d",
+			transaction.ID,
+			latestHeader.Number.Uint64(),
+			receipt.BlockNumber.Uint64(),
+			requiredConfirmations,
+		)
+		return nil
+	}
+
 	if receipt.Status == types.ReceiptStatusSuccessful {
-		// Transaction successful
 		if err := tc.handleSuccessfulTransaction(ctx, transaction, receipt); err != nil {
 			log.Errorf("Failed to handle successful transaction: %v", err)
 			return err
 		}
 	} else {
-		// Transaction failed
 		if err := tc.handleFailedTransaction(ctx, client, transaction, receipt); err != nil {
 			log.Errorf("Failed to handle failed transaction: %v", err)
 			return err
@@ -219,27 +231,33 @@ func (tc *TransactionConfirmer) confirmTransaction(ctx context.Context, transact
 
 // handleSuccessfulTransaction handles a successful transaction
 func (tc *TransactionConfirmer) handleSuccessfulTransaction(ctx context.Context, transaction *models.BlockchainTransaction, receipt *types.Receipt) error {
-	// Update transaction with receipt information
-	if err := transaction.MarkConfirmed(ctx, tc.db, receipt.BlockNumber.Int64(), int64(receipt.GasUsed), receipt.EffectiveGasPrice.String()); err != nil {
+	marked, err := transaction.MarkConfirmed(ctx, tc.db, receipt.BlockNumber.Int64(), int64(receipt.GasUsed), receipt.EffectiveGasPrice.String())
+	if err != nil {
 		return err
+	}
+	if !marked {
+		log.Infof("Transaction %d already left sent before confirmation write", transaction.ID)
+		return nil
 	}
 
 	log.Infof("Transaction %d confirmed successfully in block %d", transaction.ID, receipt.BlockNumber.Int64())
 	return nil
 }
 
-// handleFailedTransaction handles a failed transaction
+// handleFailedTransaction handles a transaction with an on-chain receipt status of 0
 func (tc *TransactionConfirmer) handleFailedTransaction(ctx context.Context, client *BlockchainClient, transaction *models.BlockchainTransaction, receipt *types.Receipt) error {
-	// Get error message from receipt
 	errorMsg, err := client.GetErrorMessageFromTransaction(ctx, transaction, receipt)
 	if err != nil {
 		errorMsg = fmt.Sprintf("Transaction failed with status 0: %v", err)
 	}
 
-	// Update transaction with receipt information
 	if err := tc.db.Transaction(func(tx *gorm.DB) error {
-		if err := transaction.MarkFailed(ctx, tx, receipt.BlockNumber.Int64(), int64(receipt.GasUsed), receipt.EffectiveGasPrice.String(), errorMsg); err != nil {
+		marked, err := transaction.MarkFailedFromSent(ctx, tx, receipt.BlockNumber.Int64(), int64(receipt.GasUsed), receipt.EffectiveGasPrice.String(), errorMsg)
+		if err != nil {
 			return err
+		}
+		if !marked {
+			return nil
 		}
 		if transaction.RetryCount < transaction.MaxRetries {
 			if err := transaction.CreateRetryTransaction(ctx, tx); err != nil {
@@ -250,27 +268,43 @@ func (tc *TransactionConfirmer) handleFailedTransaction(ctx context.Context, cli
 	}); err != nil {
 		return err
 	}
-	log.Infof("Transaction %d failed, will retry (attempt %d/%d)", transaction.ID, transaction.RetryCount+1, transaction.MaxRetries)
+	log.Infof("Transaction %d failed on-chain, will retry (attempt %d/%d)", transaction.ID, transaction.RetryCount+1, transaction.MaxRetries)
 
 	return nil
 }
 
-func (tc *TransactionConfirmer) handleTimedOutTransaction(ctx context.Context, client *BlockchainClient, transaction *models.BlockchainTransaction) error {
-	if err := tc.db.Transaction(func(tx *gorm.DB) error {
-		if err := transaction.MarkFailed(ctx, tx, 0, 0, "", "Transaction timed out"); err != nil {
-			return err
-		}
-		if transaction.RetryCount < transaction.MaxRetries {
-			if err := transaction.CreateRetryTransaction(ctx, tx); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
+func (tc *TransactionConfirmer) handleDelayedReceipt(ctx context.Context, transaction *models.BlockchainTransaction) error {
+	alerted, err := transaction.MarkReceiptDelayed(ctx, tc.db)
+	if err != nil {
 		return err
 	}
-	client.resetNonce()
-	log.Infof("Transaction %d timed out, will retry (attempt %d/%d)", transaction.ID, transaction.RetryCount+1, transaction.MaxRetries)
+	if !alerted {
+		return nil
+	}
 
+	blockingMessage := fmt.Sprintf(
+		"transaction receipt delayed without on-chain failure proof: transaction_id=%d network=%s tx_hash=%s nonce=%v",
+		transaction.ID,
+		transaction.Network,
+		transaction.TxHash.String,
+		transaction.Nonce,
+	)
+	log.WithFields(log.Fields{
+		"transaction_id": transaction.ID,
+		"network":        transaction.Network,
+		"tx_hash":        transaction.TxHash.String,
+		"nonce":          transaction.Nonce,
+	}).Error("TransactionConfirmer: " + blockingMessage)
+	alert.SafeSendAlert("TransactionConfirmer", blockingMessage)
 	return nil
+}
+
+func receiptHasRequiredConfirmations(latestBlock, receiptBlock, required uint64) bool {
+	if required == 0 {
+		return false
+	}
+	if latestBlock < receiptBlock {
+		return false
+	}
+	return latestBlock-receiptBlock >= required
 }

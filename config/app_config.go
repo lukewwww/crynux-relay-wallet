@@ -57,6 +57,7 @@ type AppConfig struct {
 		MaxRetries                uint8  `mapstructure:"max_retries"`
 		RetryInterval             uint64 `mapstructure:"retry_interval"`
 		ReceiptWaitTime           uint64 `mapstructure:"receipt_wait_time"`
+		ReceiptConfirmationBlocks uint64 `mapstructure:"receipt_confirmation_blocks"`
 		SentTransactionCountLimit uint64 `mapstructure:"sent_transaction_count_limit"`
 	} `mapstructure:"blockchains"`
 
@@ -87,9 +88,10 @@ type AppConfig struct {
 			MaxWithdrawalsPerAddressPerDay uint64 `mapstructure:"max_withdrawals_per_address_per_day"`
 		} `mapstructure:"sync_withdrawal_requests"`
 		ProcessWithdrawalRequests struct {
-			IntervalSeconds uint   `mapstructure:"interval_seconds"`
-			BatchSize       uint   `mapstructure:"batch_size"`
-			Timeout         uint64 `mapstructure:"timeout"`
+			IntervalSeconds                      uint   `mapstructure:"interval_seconds"`
+			BatchSize                            uint   `mapstructure:"batch_size"`
+			Timeout                              uint64 `mapstructure:"timeout"`
+			CancellationSettlementTimeoutSeconds uint64 `mapstructure:"cancellation_settlement_timeout_seconds"`
 		} `mapstructure:"process_withdrawal_requests"`
 	} `mapstructure:"tasks"`
 }

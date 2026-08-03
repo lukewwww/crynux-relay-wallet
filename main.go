@@ -51,7 +51,9 @@ func main() {
 	}
 	log.Infoln("Start blockchain transaction manager...")
 	tm := blockchain.NewTransactionManager(config.GetDB())
-	tm.Start(context.Background())
+	if err := tm.Start(context.Background()); err != nil {
+		log.Fatalf("Failed to start blockchain transaction manager: %v", err)
+	}
 
 	log.Infoln("Starting tasks...")
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

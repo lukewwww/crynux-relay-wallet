@@ -88,6 +88,8 @@ tasks:
     max_task_fee_amount: 100
     max_address_logs_count_in_batch: 10
     max_new_address_count_in_batch: 10
+  process_withdrawal_requests:
+    cancellation_settlement_timeout_seconds: 30
 `, feeAddress.Hex())
 	if err := os.WriteFile(filepath.Join(configDir, "config.yml"), []byte(configContent), 0600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -325,6 +327,7 @@ blockchains:
     max_retries: 1
     retry_interval: 1
     receipt_wait_time: 30
+    receipt_confirmation_blocks: 1
     sent_transaction_count_limit: 100
 relay:
   api:
@@ -333,6 +336,8 @@ relay:
 tasks:
   sync_task_fee_logs:
     deposit_max_age_seconds: 3600
+  process_withdrawal_requests:
+    cancellation_settlement_timeout_seconds: 30
 `, network, rpcEndpoint, tokenType, tokenAddressConfig, accountAddress.Hex(), filepath.ToSlash(privateKeyFile), filepath.ToSlash(privateKeyFile), depositAddress.Hex())
 	if err := os.WriteFile(filepath.Join(configDir, "config.yml"), []byte(configContent), 0600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -597,6 +602,9 @@ func TestSaveDepositRecordsRejectsDuplicateTransactionHash(t *testing.T) {
 environment: test
 relay:
   deposit_address: 0x2222222222222222222222222222222222222222
+tasks:
+  process_withdrawal_requests:
+    cancellation_settlement_timeout_seconds: 30
 `
 	if err := os.WriteFile(filepath.Join(configDir, "config.yml"), []byte(configContent), 0600); err != nil {
 		t.Fatalf("write config: %v", err)

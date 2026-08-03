@@ -24,9 +24,10 @@ For each fetched batch:
    - A request is ingestible only if `relay_account_event_id <= LatestTaskFeeLogID`.
    - At first request that violates this rule, stop batch at that point.
 3. If no ingestible requests remain, wait one sync interval and retry.
-4. Validate ingestible requests with `checkWithdrawalRequests`.
-5. Insert local `withdraw_records` with `OnConflict DoNothing`.
-6. Update withdrawal checkpoint to the last ingested request in the same transaction.
+4. Reconstruct each request's canonical authorization message as `Crynux Relay\nAction: Withdraw <amount> from <address> to <benefit_address> on <network>\nAddress: <address>\nTimestamp: <timestamp>`, recover its signer with Ethereum personal-sign semantics, and require the recovered address to equal the request address. Processing delay MUST NOT be used as a timestamp freshness check.
+5. Derive a SHA-256 authorization fingerprint from the canonical message and require uniqueness across local withdrawal records. Missing, malformed, signer-mismatched, and replayed authorizations MUST produce a local `failed` record with no blockchain transaction. Other request validation applies only to requests with valid, non-replayed authorization.
+6. Insert local `withdraw_records` with `OnConflict DoNothing`.
+7. Update withdrawal checkpoint to the last ingested request in the same transaction. Invalid authorization MUST NOT block checkpoint advancement.
 
 ## Validation Rules (`checkWithdrawalRequests`)
 
@@ -41,7 +42,7 @@ The wallet MUST enforce all rules below before storing a request:
 
 System wallet token and gas balances MUST NOT be validated during request synchronization. Insufficient system wallet balance SHALL be handled during blockchain transaction sending.
 
-Validation failure SHALL fail the sync attempt.
+Validation failure other than invalid authorization SHALL fail the sync attempt.
 
 ## Local Record Model and Status
 
@@ -55,6 +56,7 @@ The wallet stores each accepted request as `withdraw_records` with local status 
 `finished-rejected` represents `reject` callback completion and local finalization. The two terminal statuses MUST remain distinct so that rejected withdrawals can be excluded from the per-address daily withdrawal count.
 
 Each local withdrawal record MUST store the withdrawal fee reported by Relay. All wallet-side balance validation and debit rules MUST use `amount + withdrawal_fee`, because Relay charges the requester relay account by that same total amount when creating the `Withdraw` ledger event.
+Each local withdrawal record MUST also store the Relay-supplied timestamp and signature. A cryptographically valid authorization MUST store its unique authorization fingerprint. Historical rows remain nullable; a historical row without committed broadcast evidence and without valid authorization MUST follow `failed` -> `finished-rejected`.
 
 ## Execution Flow (`processWithdrawalRecord`)
 
@@ -62,24 +64,31 @@ Withdrawal record processing MUST be serial. `StartProcessWithdrawalRequests` SH
 
 This serialization boundary is the withdrawal record processor. It does not require the lower-level blockchain transaction manager to become a global serial sender. The transaction manager may keep its existing queue and confirmation behavior, but only one withdrawal record may be actively driven by `processWithdrawalRecord` at a time.
 
-Serial withdrawal processing solves the wallet-local balance race where multiple withdrawal records can queue chain transfers before any one of them performs the final local balance debit. Because withdrawals are processed one record at a time, a confirmed withdrawal updates local balance before the next withdrawal can queue or monitor its transfer. This preserves the existing simple balance model without adding a separate reserved-balance state.
+Serial withdrawal processing and the execution-time balance gate jointly protect the wallet-local balance. Synchronization can accept requests in different batches before an earlier transfer is confirmed. The processor MUST therefore reload the address balance immediately before transaction creation and MUST NOT rely on synchronization-time validation or serialization alone.
 
 For the active unfinished local record:
 
-1. If no blockchain transaction is attached, build the unsigned transaction payload for the target network.
-2. Persist a `pending` blockchain transaction and store `blockchain_transaction_id` in the same database transaction. The wallet MUST persist this local transaction before any fee estimation, signing, or broadcast attempt.
-3. The blockchain transaction sender atomically claims the persisted `pending` row by changing it to `sending`, estimates gas and fee caps, signs the transaction, broadcasts it, and marks it `sent` with `tx_hash` and `nonce` only after `eth_sendRawTransaction` succeeds.
-4. Poll transaction status until terminal (`confirmed`, `failed`, or `cancelled`) or context cancellation.
-5. If confirmed:
+1. If no blockchain transaction is attached, validate the stored authorization and unique fingerprint. Invalid authorization MUST set the record to `failed`.
+2. Reload the local relay account and require its balance to cover `amount + withdrawal_fee`. Insufficient balance MUST set the record to `failed`; the wallet MUST NOT create, sign, or broadcast a blockchain transaction.
+3. Build the unsigned transaction payload for the target network.
+4. Persist a `pending` blockchain transaction and store `blockchain_transaction_id` in the same database transaction. The wallet MUST persist this local transaction before any fee estimation, signing, or broadcast attempt.
+5. The blockchain transaction sender atomically claims the persisted `pending` row by changing it to `sending`, estimates gas and fee caps, signs the transaction, persists `broadcasting` with `tx_hash`/`nonce`/`signed_raw_tx` before RPC submission, recovers by rebroadcasting that exact payload when needed, and marks it `sent` after acknowledgment or on-chain visibility.
+6. Poll transaction status until terminal (`confirmed`, `failed`, or `cancelled`) or context cancellation.
+7. If confirmed:
+   - Verify the root transaction and its retry chain contain exactly one confirmed transfer and that every other attempt has proven terminal failure.
    - Load local relay account by record address.
    - Verify local balance is sufficient for `amount + withdrawal_fee`.
    - Decrease local balance by `amount + withdrawal_fee`.
    - Update record status to `success` in the same transaction.
-6. If failed and retries are exhausted, or if cancelled before broadcast, update record status to `failed`.
-7. After leaving pending loop:
-   - If status is `success`, call Relay `FulfillWithdrawalRequest` with tx hash and set local record status to `finished`.
-   - Otherwise call Relay `RejectWithdrawalRequest` and set local record status to `finished-rejected`.
+8. If failed and retries are exhausted, or if cancelled before broadcast, update record status to `failed`.
+9. After leaving pending loop:
+   - If status is `success`, verify the same single-confirmed-chain invariant again, call Relay `FulfillWithdrawalRequest` with tx hash, and set local record status to `finished`.
+   - Otherwise, only after the root transaction and retry chain have on-chain failure proof or an unbroadcasted cancellation, call Relay `RejectWithdrawalRequest` and set local record status to `finished-rejected`.
 
+When processing starts from a persisted `success` record after restart, the processor MUST reload the current transaction from `blockchain_transaction_id`, including the latest retry-chain member, and run the single-confirmed safety gate before Fulfill. It MUST NOT debit the local balance again.
+
+Reject and Fulfill MUST use the same complete-chain safety gate. A cancelled current retry MUST NOT bypass inspection of timeout-failed or otherwise uncertain ancestors. Any confirmed ancestor MUST block Reject. Any historical receipt-timeout failure, `broadcasting` row, `sent` row, or other unproven broadcast outcome MUST block Reject and Fulfill.
+Committed broadcast evidence has priority over authorization validation. Once any transaction in the attached chain has `tx_hash`, `signed_raw_tx`, `broadcasting`, or `sent` state, missing or invalid authorization MUST NOT cause Reject or refund.
 ## Dynamic Fee Estimation and Sending
 
 Withdrawal blockchain transactions on EVM-compatible networks SHALL use EIP-1559 dynamic fee transactions (`DynamicFeeTx`). The wallet does not use a configured legacy `gas_price` for withdrawal execution.
@@ -114,13 +123,27 @@ If hot wallet native payout balance, ERC20 payout balance, or native gas balance
 
 Blockchain transaction persistence is a local queueing step, not proof of network submission. If estimation fails or exceeds configured caps before broadcast, the sender MUST release the transaction back to `pending` without `tx_hash`, and the transaction remains eligible for a later send attempt.
 
-The sender MUST use the persisted transaction state as the concurrency boundary. It MUST atomically change an unbroadcasted `pending` transaction to `sending` before gas estimation, signing, or broadcasting. A timeout handler MUST NOT cancel a transaction in `sending`. If sending fails before successful broadcast, the sender MUST return the transaction to `pending`. A transaction becomes `sent` only after broadcast succeeds and the wallet records the returned transaction hash and nonce.
+The sender MUST use the persisted transaction state as the concurrency boundary. It MUST atomically change an unbroadcasted `pending` transaction with no cancellation request to `sending` before gas estimation or signing. A transaction with `cancellation_requested_at` set MUST NOT be claimed for sending.
+
+After the sender signs a transaction and before it calls `eth_sendRawTransaction`, it MUST atomically prepare the broadcast by changing `sending` to `broadcasting` and persisting `tx_hash`, `nonce`, and `signed_raw_tx` in the same conditional update. That update MUST require `cancellation_requested_at IS NULL`. If cancellation was requested first, prepare MUST fail, the sender MUST release the unbroadcasted `sending` row, and the transaction MUST NOT be broadcast.
+
+A `broadcasting` transaction is a committed broadcast attempt. It MUST NOT be released back to `pending`, MUST NOT accept cancellation, and MUST NOT cause a Relay reject or refund. The sender MUST recover `broadcasting` rows on startup and on every poll by querying the persisted hash and, when the transaction is not yet visible, rebroadcasting the exact persisted `signed_raw_tx`. The sender MUST change `broadcasting` to `sent` only after the RPC accepts the raw transaction, returns an already-known acknowledgment, or the chain makes the hash visible. The same network MUST NOT claim a new pending payout while any `broadcasting` row remains unresolved.
+
+Before starting sender or confirmer workers, the transaction manager MUST synchronously recover legacy `sending` rows that have neither `tx_hash` nor `signed_raw_tx`. A row without a cancellation request MUST return to `pending`; a row with a cancellation request MUST become `cancelled`. `broadcasting`, `sent`, and any `sending` row with committed broadcast evidence MUST remain unchanged. Recovery failure MUST abort transaction-manager startup.
+
+Timeout cancellation and sender release MUST use a persisted cancellation handshake. The timeout handler MUST set `cancellation_requested_at` and the cancellation reason exactly once on an unbroadcasted `pending` or `sending` transaction. A repeated cancellation request MUST preserve the original timestamp and reason. If sending fails before broadcast preparation, the sender MUST atomically release `sending` to `cancelled` when cancellation has been requested, or to `pending` otherwise. If release reaches `pending` before the cancellation request obtains the row lock, the cancellation request MUST make that row ineligible for another sender claim and the timeout handler MUST then change it to `cancelled`.
+
+Successful broadcast preparation has priority over concurrent cancellation. Once `tx_hash` and `signed_raw_tx` are persisted, the transaction MUST proceed to `sent`/`confirmed`/`failed` from chain evidence and MUST NOT be rejected or refunded because of a concurrent cancellation request.
+
+The confirmer MUST query the receipt before applying any receipt-wait deadline. After a receipt is found, the confirmer MUST query the latest block and MUST wait until `latest_block >= receipt.block_number + receipt_confirmation_blocks` before acting on that receipt. `receipt_confirmation_blocks` is a required per-network configuration value that counts blocks after the receipt block. While waiting for that depth, the transaction MUST remain `sent`. If a later poll finds the receipt missing or changed after a reorg, the confirmer MUST continue from the latest chain evidence and MUST NOT apply an earlier provisional receipt outcome.
+
+Receipt `status=1` with the required confirmation depth MUST mark the transaction confirmed through a conditional `sent -> confirmed` update. Receipt `status=0` with the required confirmation depth is the only automatic on-chain failure proof that MAY create one new-nonce retry. That failure transition MUST be a conditional `sent -> failed` update, and only the first successful transition MAY create a retry. The sender MUST refuse to claim a retry while any ancestor lacks that proven on-chain failure. If the receipt is still missing after `receipt_wait_time`, the confirmer MUST keep the transaction in `sent`, persist a delayed-receipt status message at most once, alert operators, and continue polling. Receipt delay MUST NOT mark the transaction failed and MUST NOT create a retry.
 
 This design deliberately keeps withdrawal execution globally serial. A withdrawal record delayed by dynamic fee caps blocks later withdrawal records, including records for other networks, until it succeeds or reaches timeout. If timeout occurs while its blockchain transaction is still unbroadcasted and cancellable, the wallet MUST cancel that transaction before rejecting the Relay withdrawal.
 
-After a transaction is broadcast and a `tx_hash` is recorded, withdrawal timeout MUST NOT be used to reject or refund the Relay withdrawal. The withdrawal MUST remain bound to the chain transaction result.
+After a transaction has a persisted `tx_hash` or `signed_raw_tx`, withdrawal timeout MUST NOT be used to reject or refund the Relay withdrawal. The withdrawal MUST remain bound to the chain transaction result. Before any Relay reject for a withdrawal with an attached blockchain transaction, including timeout cancellation of an unbroadcasted current row, the processor MUST inspect the root transaction and its retry chain. Proven terminal failure means an unbroadcasted `cancelled` row or a receipt `status=0` failure that reached the configured confirmation depth. If any row is `broadcasting`, `sent`, failed only because of a historical receipt timeout, confirmed, or otherwise lacks that proven failure, the processor MUST fail-stop without rejecting.
 
-When the timeout handler runs, including after a service restart, it MUST first inspect the persisted blockchain transaction state. This inspection is a recovery step for records whose chain transaction state changed outside the active withdrawal processor, such as a transaction confirmed after the processor had already stopped. If the transaction is already in a terminal local state, processing MUST resume through the normal success or failure finalization path. If the transaction is still broadcast and non-terminal at that moment, the processor MUST NOT keep waiting past the withdrawal deadline. It MUST log an error with the withdrawal record ID, remote ID, blockchain transaction ID, transaction status, and transaction hash, then return an error for the alerting path and stop processing later withdrawal records.
+When the timeout handler runs, including after a service restart, it MUST inspect the persisted blockchain transaction state once per processing-loop iteration. This inspection is a recovery step for records whose chain transaction state changed outside the active withdrawal processor, such as a transaction confirmed after the processor had already stopped. If the transaction is already in a terminal local state, processing MUST resume through the normal success or failure finalization path. If the transaction is broadcast and non-terminal, the processor MUST log an error with the withdrawal record ID, remote ID, blockchain transaction ID, transaction status, transaction hash, and cancellation request timestamp, then return an error for the alerting path and stop processing later withdrawal records.
 
 The wallet does not separately estimate or cap rollup parent-chain data fees through chain-specific fee oracle contracts. For supported EVM rollups, fee control is limited to standard gas estimation, buffered `gas_limit`, and EIP-1559 fee caps. Arbitrum Nitro-style gas estimates include the parent-chain posting buffer in the returned gas estimate. Base-style L1 security fee estimation is not a separate requirement in this wallet.
 
@@ -133,8 +156,11 @@ Each record processing attempt SHALL run with a per-record deadline:
 If deadline is exceeded:
 
 - If no blockchain transaction is attached, call Relay `RejectWithdrawalRequest` and set local status to `finished-rejected`.
-- If the current blockchain transaction is `pending` and has no `tx_hash`, atomically change it to `cancelled`, call Relay `RejectWithdrawalRequest`, and set local status to `finished-rejected`.
-- If the current blockchain transaction has been broadcast or is otherwise not cancellable and has not reached a terminal state at timeout handling time, do not reject the Relay withdrawal and do not continue waiting. Log the blocking transaction context, return timeout error for the alerting path, and stop processing later withdrawal records.
+- If the current blockchain transaction is unbroadcasted `pending`, persist its cancellation request, atomically change it to `cancelled`, call Relay `RejectWithdrawalRequest`, and set local status to `finished-rejected`.
+- If the current blockchain transaction is unbroadcasted `sending`, persist its cancellation request and return to the existing per-record processing loop while the sender settles the transaction. The settlement deadline MUST equal the persisted `cancellation_requested_at + cancellation_settlement_timeout_seconds`. Process restart and repeated timeout handling MUST NOT move this deadline.
+- If sender release changes the requested transaction to `cancelled`, resume normal rejected finalization. If sender broadcast preparation persists `tx_hash`/`signed_raw_tx` and later reaches `sent`, do not reject the Relay withdrawal.
+- If an unbroadcasted `sending` transaction remains unsettled at the cancellation settlement deadline, do not reject the Relay withdrawal. Log the blocking transaction context, return timeout error for the alerting path, and stop processing later withdrawal records.
+- If the current blockchain transaction is `broadcasting`, has any persisted broadcast payload, or is otherwise neither cancellable nor terminal at timeout handling time, do not reject the Relay withdrawal. Log the blocking transaction context, return timeout error for the alerting path, and stop processing later withdrawal records.
 - If the current blockchain transaction reached a terminal local state before timeout handling, resume normal finalization from that terminal state. This covers recovery after processor interruption; it is not a continued wait past the withdrawal deadline.
 
 ## Balance Ownership Rule
@@ -143,4 +169,5 @@ Local account balance adjustment for withdrawals SHALL remain owned by withdrawa
 
 - Balance is decreased only after confirmed chain transfer.
 - The decreased amount MUST be `amount + withdrawal_fee`.
+- Current balance MUST be checked again immediately before blockchain transaction creation. This check is the execution gate for requests accepted in different synchronization batches.
 - Withdrawal-related Relay account logs (`Withdraw`, `WithdrawRefund`) are not used to adjust local balance in log sync.

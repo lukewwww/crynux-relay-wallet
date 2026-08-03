@@ -2,6 +2,7 @@ package blockchain
 
 import (
 	"context"
+	"crynux_relay_wallet/models"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
@@ -31,12 +32,16 @@ func NewTransactionManager(db *gorm.DB) *TransactionManager {
 }
 
 // Start starts the transaction manager and all its components
-func (tm *TransactionManager) Start(ctx context.Context) {
+func (tm *TransactionManager) Start(ctx context.Context) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	if tm.isRunning {
-		return
+		return nil
+	}
+
+	if err := models.RecoverLegacySendingTransactions(ctx, tm.db); err != nil {
+		return err
 	}
 
 	tm.isRunning = true
@@ -46,6 +51,7 @@ func (tm *TransactionManager) Start(ctx context.Context) {
 	tm.confirmer.Start(ctx)
 
 	log.Info("Transaction manager started")
+	return nil
 }
 
 // Stop stops the transaction manager and all its components

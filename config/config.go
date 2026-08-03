@@ -37,6 +37,9 @@ func InitConfig(configPath string) error {
 	if err := v.Unmarshal(appConfig); err != nil {
 		return err
 	}
+	if appConfig.Tasks.ProcessWithdrawalRequests.CancellationSettlementTimeoutSeconds == 0 {
+		return errors.New("process withdrawal requests cancellation settlement timeout seconds not set")
+	}
 
 	if appConfig.Environment == EnvTest {
 		privKey := GetTestPrivateKey()
@@ -86,6 +89,9 @@ func checkBlockchainAccount() error {
 		}
 		if blockchain.GasLimitBufferPercent == 0 {
 			return fmt.Errorf("blockchain %s gas limit buffer percent not set", network)
+		}
+		if blockchain.ReceiptConfirmationBlocks == 0 {
+			return fmt.Errorf("blockchain %s receipt confirmation blocks not set", network)
 		}
 		if blockchain.Account.PrivateKey == "" {
 			return errors.New("blockchain account private key not set")

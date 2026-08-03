@@ -36,6 +36,7 @@ blockchains:
     max_retries: 3
     retry_interval: 3
     receipt_wait_time: 30
+    receipt_confirmation_blocks: 1
     sent_transaction_count_limit: 200
   crynux-on-base-sepolia:
     rps: 20
@@ -54,6 +55,7 @@ blockchains:
     max_retries: 3
     retry_interval: 3
     receipt_wait_time: 30
+    receipt_confirmation_blocks: 1
     sent_transaction_count_limit: 200
 relay:
   api:
@@ -78,3 +80,4 @@ tasks:
     interval_seconds: 5
     batch_size: 10
     timeout: 300
+    cancellation_settlement_timeout_seconds: 30

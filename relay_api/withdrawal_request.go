@@ -30,6 +30,8 @@ type WithdrawalRequest struct {
 	Network             string         `json:"network"`
 	Status              WithdrawStatus `json:"status"`
 	RelayAccountEventID uint           `json:"relay_account_event_id"`
+	Timestamp           int64          `json:"timestamp"`
+	Signature           string         `json:"signature"`
 }
 
 type GetWithdrawalRequestsInput struct {

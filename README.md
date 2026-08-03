@@ -25,7 +25,9 @@ In the current design, user funds remain safe under that assumption; at worst, a
 - The Relay exposes HTTPS APIs to prevent on-path tampering.
 - The Relay Wallet uses an egress IP allowlist to reach only the Relay and a few blockchain nodes.
 - For privacy, the Relay can require an API key so that withdrawal activity is not broadly visible. The data itself is public and not privileged.
-- The Relay Wallet validates a withdrawal by verifying the signature from the requesting node address. A Relay-side signature is not required.
+- Relay persists and returns the original user withdrawal timestamp and signature. The Relay Wallet independently reconstructs the signed message and recovers the requesting address without applying a processing-time freshness check.
+- The Relay Wallet stores a unique authorization fingerprint. Missing, malformed, mismatched, or replayed authorizations are rejected before any blockchain transaction is created.
+- A persisted transaction hash or signed raw transaction is committed broadcast evidence. Such a withdrawal MUST converge from blockchain evidence and MUST NOT be rejected because its user authorization fields are missing or invalid.
 
 ## Withdrawals
 

@@ -190,9 +190,26 @@ func (client *BlockchainClient) IncrementNonce() {
 	*client.Nonce++
 }
 
+func (client *BlockchainClient) AdvanceNoncePast(nonce int64) {
+	next := uint64(nonce) + 1
+	if client.Nonce == nil || *client.Nonce < next {
+		client.Nonce = &next
+	}
+}
+
 func matchNonceError(errStr string) bool {
 	res := pattern.FindStringSubmatch(errStr)
 	return res != nil
+}
+
+func isAlreadyKnownTransactionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already known") ||
+		strings.Contains(msg, "known transaction") ||
+		strings.Contains(msg, "already imported")
 }
 
 func (client *BlockchainClient) processSendingTxError(err error) error {
@@ -200,6 +217,34 @@ func (client *BlockchainClient) processSendingTxError(err error) error {
 		client.Nonce = nil
 	}
 	return err
+}
+
+func (client *BlockchainClient) SendSignedRawTransaction(ctx context.Context, signedRawTx string) (*types.Transaction, error) {
+	raw, err := hexutil.Decode(signedRawTx)
+	if err != nil {
+		return nil, err
+	}
+	signedTx := new(types.Transaction)
+	if err := signedTx.UnmarshalBinary(raw); err != nil {
+		return nil, err
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := client.Limiter.Wait(callCtx); err != nil {
+		return nil, err
+	}
+	if err := client.RpcClient.SendTransaction(callCtx, signedTx); err != nil {
+		return signedTx, client.processSendingTxError(err)
+	}
+	return signedTx, nil
+}
+
+func EncodeSignedRawTransaction(signedTx *types.Transaction) (string, error) {
+	raw, err := signedTx.MarshalBinary()
+	if err != nil {
+		return "", err
+	}
+	return hexutil.Encode(raw), nil
 }
 
 func (client *BlockchainClient) resetNonce() {

@@ -8,7 +8,9 @@ import (
 	"crynux_relay_wallet/models"
 	"crynux_relay_wallet/relay_api"
 	"crynux_relay_wallet/utils"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
@@ -16,6 +18,8 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/crypto"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -47,6 +51,10 @@ var ErrWithdrawalRequestBeneficialAddressInvalid = NewWithdrawalRequestError("wi
 var ErrWithdrawalRequestAmountTooSmall = NewWithdrawalRequestError("withdrawal request amount is too small")
 var ErrWithdrawalRequestTransactionUnconfirmedTimeout = NewWithdrawalRequestError("withdrawal request transaction remains unconfirmed after timeout")
 var ErrWithdrawalRequestDailyLimitExceeded = NewWithdrawalRequestError("withdrawal request count exceeds daily limit per address")
+var ErrWithdrawalAuthorizationMissing = errors.New("withdrawal authorization is missing")
+var ErrWithdrawalAuthorizationInvalid = errors.New("withdrawal authorization is invalid")
+var ErrWithdrawalAuthorizationAddressMismatch = errors.New("withdrawal authorization address mismatch")
+var ErrWithdrawalAuthorizationReplayed = errors.New("withdrawal authorization has already been used")
 
 func parseWithdrawalAmount(amountText string) (*big.Int, error) {
 	amount, ok := big.NewInt(0).SetString(amountText, 10)
@@ -58,6 +66,103 @@ func parseWithdrawalAmount(amountText string) (*big.Int, error) {
 
 func withdrawalTotalAmount(amount, withdrawalFee *big.Int) *big.Int {
 	return big.NewInt(0).Add(amount, withdrawalFee)
+}
+
+func buildWithdrawalAuthorizationMessage(address, amount, benefitAddress, network string, timestamp int64) string {
+	action := fmt.Sprintf("Withdraw %s from %s to %s on %s", amount, address, benefitAddress, network)
+	return fmt.Sprintf("Crynux Relay\nAction: %s\nAddress: %s\nTimestamp: %d", action, address, timestamp)
+}
+
+func validateWithdrawalAuthorization(
+	address, amount, benefitAddress, network string,
+	timestamp sql.NullInt64,
+	signature sql.NullString,
+) (string, error) {
+	if !timestamp.Valid || !signature.Valid || strings.TrimSpace(signature.String) == "" {
+		return "", ErrWithdrawalAuthorizationMissing
+	}
+
+	sigBytes, err := hexutil.Decode("0x" + strings.TrimPrefix(signature.String, "0x"))
+	if err != nil || len(sigBytes) != 65 {
+		return "", ErrWithdrawalAuthorizationInvalid
+	}
+	if sigBytes[64] == 27 || sigBytes[64] == 28 {
+		sigBytes[64] -= 27
+	}
+
+	message := buildWithdrawalAuthorizationMessage(address, amount, benefitAddress, network, timestamp.Int64)
+	prefix := fmt.Sprintf("\x19Ethereum Signed Message:\n%d", len(message))
+	publicKey, err := crypto.SigToPub(crypto.Keccak256([]byte(prefix+message)), sigBytes)
+	if err != nil {
+		return "", ErrWithdrawalAuthorizationInvalid
+	}
+	if !strings.EqualFold(crypto.PubkeyToAddress(*publicKey).Hex(), address) {
+		return "", ErrWithdrawalAuthorizationAddressMismatch
+	}
+
+	fingerprint := sha256.Sum256([]byte(message))
+	return hex.EncodeToString(fingerprint[:]), nil
+}
+
+func withdrawalRequestAuthorization(request relay_api.WithdrawalRequest, amount *big.Int) (string, error) {
+	return validateWithdrawalAuthorization(
+		request.Address,
+		amount.String(),
+		request.BenefitAddress,
+		request.Network,
+		sql.NullInt64{Int64: request.Timestamp, Valid: request.Timestamp != 0},
+		sql.NullString{String: request.Signature, Valid: request.Signature != ""},
+	)
+}
+
+func withdrawalRecordAuthorization(record *models.WithdrawRecord) (string, error) {
+	return validateWithdrawalAuthorization(
+		record.Address,
+		record.Amount.String(),
+		record.BenefitAddress,
+		record.Network,
+		record.Timestamp,
+		record.Signature,
+	)
+}
+
+func ensureWithdrawalAuthorizationFingerprint(ctx context.Context, db *gorm.DB, record *models.WithdrawRecord) error {
+	fingerprint, err := withdrawalRecordAuthorization(record)
+	if err != nil {
+		return err
+	}
+	if record.AuthorizationFingerprint.Valid {
+		if record.AuthorizationFingerprint.String != fingerprint {
+			return ErrWithdrawalAuthorizationInvalid
+		}
+		return nil
+	}
+
+	var existingCount int64
+	if err := db.WithContext(ctx).Model(&models.WithdrawRecord{}).
+		Where("authorization_fingerprint = ? AND id <> ?", fingerprint, record.ID).
+		Count(&existingCount).Error; err != nil {
+		return err
+	}
+	if existingCount > 0 {
+		return ErrWithdrawalAuthorizationReplayed
+	}
+	record.AuthorizationFingerprint = sql.NullString{String: fingerprint, Valid: true}
+	return db.WithContext(ctx).Model(record).
+		Update("authorization_fingerprint", record.AuthorizationFingerprint).Error
+}
+
+func withdrawalChainHasCommittedBroadcast(ctx context.Context, db *gorm.DB, rootID uint) (bool, error) {
+	transactions, err := models.ListTransactionChain(ctx, db, rootID)
+	if err != nil {
+		return false, err
+	}
+	for i := range transactions {
+		if transactions[i].HasCommittedBroadcast() {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func withdrawalRequestLogFields(request relay_api.WithdrawalRequest) log.Fields {
@@ -371,14 +476,9 @@ func syncWithdrawalRequests(ctx context.Context, intervalSeconds uint) error {
 
 		logWithdrawalRequestsReceived(requests)
 
-		err = checkWithdrawalRequests(ctx, db, requests)
-		logWithdrawalValidationResults(requests, err)
-		if err != nil {
-			logWithdrawalRequestFailures(requests, err)
-			return err
-		}
-
 		var records []*models.WithdrawRecord
+		validRequests := make([]relay_api.WithdrawalRequest, 0, len(requests))
+		seenFingerprints := make(map[string]struct{})
 		for _, request := range requests {
 			amount, err := parseWithdrawalAmount(request.Amount)
 			if err != nil {
@@ -388,7 +488,7 @@ func syncWithdrawalRequests(ctx context.Context, intervalSeconds uint) error {
 			if err != nil {
 				return err
 			}
-			records = append(records, &models.WithdrawRecord{
+			record := &models.WithdrawRecord{
 				RemoteID:       request.ID,
 				Address:        request.Address,
 				BenefitAddress: request.BenefitAddress,
@@ -396,7 +496,43 @@ func syncWithdrawalRequests(ctx context.Context, intervalSeconds uint) error {
 				WithdrawalFee:  models.BigInt{Int: *withdrawalFee},
 				Network:        request.Network,
 				Status:         models.WithdrawStatusPending,
-			})
+				Timestamp:      sql.NullInt64{Int64: request.Timestamp, Valid: request.Timestamp != 0},
+				Signature:      sql.NullString{String: request.Signature, Valid: request.Signature != ""},
+			}
+
+			fingerprint, authorizationErr := withdrawalRequestAuthorization(request, amount)
+			if authorizationErr == nil {
+				var existingCount int64
+				if _, exists := seenFingerprints[fingerprint]; exists {
+					authorizationErr = ErrWithdrawalAuthorizationReplayed
+				} else if err := db.WithContext(ctx).Model(&models.WithdrawRecord{}).
+					Where("authorization_fingerprint = ? AND remote_id <> ?", fingerprint, request.ID).
+					Count(&existingCount).Error; err != nil {
+					return err
+				} else if existingCount > 0 {
+					authorizationErr = ErrWithdrawalAuthorizationReplayed
+				}
+			}
+			if authorizationErr != nil {
+				record.Status = models.WithdrawStatusFailed
+				log.WithFields(withdrawalRequestLogFields(request)).
+					WithError(authorizationErr).
+					Info("Withdrawal authorization validation failed")
+			} else {
+				record.AuthorizationFingerprint = sql.NullString{String: fingerprint, Valid: true}
+				seenFingerprints[fingerprint] = struct{}{}
+				validRequests = append(validRequests, request)
+			}
+			records = append(records, record)
+		}
+
+		if len(validRequests) > 0 {
+			err = checkWithdrawalRequests(ctx, db, validRequests)
+			logWithdrawalValidationResults(validRequests, err)
+			if err != nil {
+				logWithdrawalRequestFailures(validRequests, err)
+				return err
+			}
 		}
 
 		if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -427,8 +563,66 @@ func getUnfinishedWithdrawalRecords(ctx context.Context, db *gorm.DB, startID ui
 func processWithdrawalRecord(ctx context.Context, db *gorm.DB, record *models.WithdrawRecord) (err error) {
 	var blockchainTransaction *models.BlockchainTransaction
 	for record.Status == models.WithdrawStatusPending {
+		if record.BlockchainTransactionID.Valid {
+			rootID := uint(record.BlockchainTransactionID.Int64)
+			committed, err := withdrawalChainHasCommittedBroadcast(ctx, db, rootID)
+			if err != nil {
+				return err
+			}
+			if !committed {
+				if authorizationErr := ensureWithdrawalAuthorizationFingerprint(ctx, db, record); authorizationErr != nil {
+					blockchainTransaction, err = getCurrentBlockchainTransaction(ctx, db, rootID)
+					if err != nil {
+						return err
+					}
+					if blockchainTransaction.Status == models.TransactionStatusPending ||
+						blockchainTransaction.Status == models.TransactionStatusSending {
+						if _, err := blockchainTransaction.RequestCancellation(ctx, db, authorizationErr.Error()); err != nil {
+							return err
+						}
+					}
+					if blockchainTransaction.Status == models.TransactionStatusPending {
+						cancelled, err := blockchainTransaction.CancelRequestedUnbroadcasted(ctx, db)
+						if err != nil {
+							return err
+						}
+						if !cancelled {
+							continue
+						}
+					}
+					if blockchainTransaction.Status != models.TransactionStatusSending {
+						if err := record.UpdateStatus(ctx, db, models.WithdrawStatusFailed); err != nil {
+							return err
+						}
+						logWithdrawalRecordFailed(record, authorizationErr, blockchainTransaction)
+						break
+					}
+				}
+			}
+		}
 
 		if !record.BlockchainTransactionID.Valid {
+			if authorizationErr := ensureWithdrawalAuthorizationFingerprint(ctx, db, record); authorizationErr != nil {
+				if err := record.UpdateStatus(ctx, db, models.WithdrawStatusFailed); err != nil {
+					return err
+				}
+				logWithdrawalRecordFailed(record, authorizationErr, nil)
+				break
+			}
+
+			totalAmount := withdrawalTotalAmount(&record.Amount.Int, &record.WithdrawalFee.Int)
+			var account models.RelayAccount
+			if err := db.WithContext(ctx).Where("address = ?", record.Address).First(&account).Error; err != nil {
+				return err
+			}
+			if account.Balance.Cmp(totalAmount) < 0 {
+				if err := record.UpdateStatus(ctx, db, models.WithdrawStatusFailed); err != nil {
+					return err
+				}
+				logWithdrawalRecordFailed(record, ErrWithdrawalRequestTaskFeeNotEnough, nil)
+				break
+			}
+
 			var toAddress common.Address
 			if record.BenefitAddress != "" {
 				toAddress = common.HexToAddress(record.BenefitAddress)
@@ -481,6 +675,9 @@ func processWithdrawalRecord(ctx context.Context, db *gorm.DB, record *models.Wi
 		}
 
 		if blockchainTransaction.Status == models.TransactionStatusConfirmed {
+			if err := ensureWithdrawalFulfillSafe(ctx, db, record, blockchainTransaction); err != nil {
+				return err
+			}
 			totalAmount := withdrawalTotalAmount(&record.Amount.Int, &record.WithdrawalFee.Int)
 			remainingBalance := ""
 			err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) (err error) {
@@ -539,6 +736,18 @@ func processWithdrawalRecord(ctx context.Context, db *gorm.DB, record *models.Wi
 	}
 
 	if record.Status == models.WithdrawStatusSuccess {
+		if blockchainTransaction == nil {
+			if !record.BlockchainTransactionID.Valid {
+				return fmt.Errorf("successful withdrawal record has no blockchain transaction")
+			}
+			blockchainTransaction, err = getCurrentBlockchainTransaction(ctx, db, uint(record.BlockchainTransactionID.Int64))
+			if err != nil {
+				return err
+			}
+		}
+		if err := ensureWithdrawalFulfillSafe(ctx, db, record, blockchainTransaction); err != nil {
+			return err
+		}
 		err = relay_api.FulfillWithdrawalRequest(ctx, record.RemoteID, blockchainTransaction.TxHash.String)
 		if err != nil {
 			return err
@@ -548,14 +757,14 @@ func processWithdrawalRecord(ctx context.Context, db *gorm.DB, record *models.Wi
 		}
 		logWithdrawalFulfilled(record, blockchainTransaction)
 	} else {
-		err = relay_api.RejectWithdrawalRequest(ctx, record.RemoteID)
-		if err != nil {
+		if err := rejectWithdrawalRequestSafely(ctx, db, record, blockchainTransaction); err != nil {
 			return err
 		}
-		if err = record.UpdateStatus(ctx, db, models.WithdrawStatusFinishedRejected); err != nil {
-			return err
+		processErr := errors.New("withdrawal request rejected before blockchain broadcast")
+		if blockchainTransaction != nil {
+			processErr = fmt.Errorf("withdrawal request blockchain transaction ended with status %d", blockchainTransaction.Status)
 		}
-		logWithdrawalRecordFailed(record, fmt.Errorf("withdrawal request blockchain transaction ended with status %d", blockchainTransaction.Status), blockchainTransaction)
+		logWithdrawalRecordFailed(record, processErr, blockchainTransaction)
 	}
 	return nil
 }
@@ -578,30 +787,122 @@ func getCurrentBlockchainTransaction(ctx context.Context, db *gorm.DB, id uint) 
 	return blockchainTransaction, nil
 }
 
-func rejectTimeoutWithdrawalRequest(ctx context.Context, db *gorm.DB, record *models.WithdrawRecord) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+func ensureWithdrawalRejectSafe(
+	ctx context.Context,
+	db *gorm.DB,
+	record *models.WithdrawRecord,
+) error {
+	if record == nil || !record.BlockchainTransactionID.Valid {
+		return nil
+	}
 
-	log.Infof("ProcessWithdrawalRecords: process withdrawal record %d timeout", record.ID)
-	if err := relay_api.RejectWithdrawalRequest(ctx, record.RemoteID); err != nil {
-		log.Errorf("ProcessWithdrawalRecords: reject timeout withdrawal record %d error %v", record.ID, err)
+	transactions, err := models.ListTransactionChain(ctx, db, uint(record.BlockchainTransactionID.Int64))
+	if err != nil {
 		return err
 	}
-	if err := record.UpdateStatus(ctx, db, models.WithdrawStatusFinishedRejected); err != nil {
-		log.Errorf("ProcessWithdrawalRecords: update timeout withdrawal record %d status error %v", record.ID, err)
+	outcome := models.ClassifyTransactionChain(transactions)
+	if outcome.ConfirmedCount > 0 {
+		blocker := outcome.Blocking
+		for i := range transactions {
+			if transactions[i].Status == models.TransactionStatusConfirmed {
+				return stopForBlockingTimeout(record, &transactions[i])
+			}
+		}
+		if blocker != nil {
+			return stopForBlockingTimeout(record, blocker)
+		}
+		return stopForBlockingTimeout(record, &transactions[0])
+	}
+	if !outcome.AllProvenFail {
+		if outcome.Blocking != nil {
+			return stopForBlockingTimeout(record, outcome.Blocking)
+		}
+		return stopForBlockingTimeout(record, &transactions[0])
+	}
+	return nil
+}
+
+func ensureWithdrawalFulfillSafe(
+	ctx context.Context,
+	db *gorm.DB,
+	record *models.WithdrawRecord,
+	current *models.BlockchainTransaction,
+) error {
+	if record == nil || !record.BlockchainTransactionID.Valid {
+		return fmt.Errorf("withdrawal fulfill safety check requires an attached blockchain transaction")
+	}
+	if current == nil || current.Status != models.TransactionStatusConfirmed || !current.TxHash.Valid {
+		if current == nil {
+			return ErrWithdrawalRequestTransactionUnconfirmedTimeout
+		}
+		return stopForBlockingTimeout(record, current)
+	}
+
+	transactions, err := models.ListTransactionChain(ctx, db, uint(record.BlockchainTransactionID.Int64))
+	if err != nil {
+		return err
+	}
+	outcome := models.ClassifyTransactionChain(transactions)
+	if outcome.ConfirmedCount != 1 {
+		if outcome.Blocking != nil {
+			return stopForBlockingTimeout(record, outcome.Blocking)
+		}
+		return stopForBlockingTimeout(record, current)
+	}
+	for i := range transactions {
+		transaction := &transactions[i]
+		if transaction.Status == models.TransactionStatusConfirmed {
+			continue
+		}
+		if !transaction.IsProvenTerminalFailure() {
+			return stopForBlockingTimeout(record, transaction)
+		}
+	}
+	return nil
+}
+
+func rejectWithdrawalRequestSafely(
+	ctx context.Context,
+	db *gorm.DB,
+	record *models.WithdrawRecord,
+	blockchainTransaction *models.BlockchainTransaction,
+) error {
+	if err := ensureWithdrawalRejectSafe(ctx, db, record); err != nil {
+		return err
+	}
+
+	rejectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	fields := log.Fields{
+		"record_id": record.ID,
+		"remote_id": record.RemoteID,
+	}
+	if blockchainTransaction != nil {
+		fields["blockchain_transaction_id"] = blockchainTransaction.ID
+		fields["transaction_status"] = blockchainTransaction.Status
+		fields["tx_hash"] = blockchainTransaction.TxHash.String
+	}
+	log.WithFields(fields).Info("ProcessWithdrawalRecords: rejecting withdrawal record")
+	if err := relay_api.RejectWithdrawalRequest(rejectCtx, record.RemoteID); err != nil {
+		log.Errorf("ProcessWithdrawalRecords: reject withdrawal record %d error %v", record.ID, err)
+		return err
+	}
+	if err := record.UpdateStatus(rejectCtx, db, models.WithdrawStatusFinishedRejected); err != nil {
+		log.Errorf("ProcessWithdrawalRecords: update rejected withdrawal record %d status error %v", record.ID, err)
 		return err
 	}
 	return nil
 }
 
-func handleTimeoutWithdrawalRequest(ctx context.Context, db *gorm.DB, record *models.WithdrawRecord) error {
+func handleTimeoutWithdrawalRequest(ctx context.Context, db *gorm.DB, record *models.WithdrawRecord) (bool, error) {
 	if err := db.WithContext(ctx).First(record, record.ID).Error; err != nil {
-		return err
+		return false, err
 	}
 	if record.BlockchainTransactionID.Valid {
 		blockchainTransaction, err := getCurrentBlockchainTransaction(ctx, db, uint(record.BlockchainTransactionID.Int64))
 		if err != nil {
-			return err
+			return false, err
 		}
 		if blockchainTransaction.Status == models.TransactionStatusConfirmed ||
 			blockchainTransaction.Status == models.TransactionStatusCancelled ||
@@ -615,48 +916,79 @@ func handleTimeoutWithdrawalRequest(ctx context.Context, db *gorm.DB, record *mo
 			}).Info("ProcessWithdrawalRecords: finalizing timeout withdrawal record with terminal blockchain transaction")
 			finalizeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			return processWithdrawalRecord(finalizeCtx, db, record)
+			return true, processWithdrawalRecord(finalizeCtx, db, record)
 		}
-		if blockchainTransaction.Status == models.TransactionStatusPending && !blockchainTransaction.TxHash.Valid {
-			cancelled, err := blockchainTransaction.CancelUnbroadcasted(ctx, db, "Withdrawal request timed out before broadcast")
+		if blockchainTransaction.HasCommittedBroadcast() ||
+			blockchainTransaction.Status == models.TransactionStatusBroadcasting ||
+			(blockchainTransaction.Status != models.TransactionStatusPending &&
+				blockchainTransaction.Status != models.TransactionStatusSending) {
+			return false, stopForBlockingTimeout(record, blockchainTransaction)
+		}
+
+		if _, err := blockchainTransaction.RequestCancellation(ctx, db, "Withdrawal request timed out before broadcast"); err != nil {
+			return false, err
+		}
+
+		if blockchainTransaction.Status == models.TransactionStatusPending {
+			cancelled, err := blockchainTransaction.CancelRequestedUnbroadcasted(ctx, db)
 			if err != nil {
-				return err
+				return false, err
 			}
 			if cancelled {
-				if err := rejectTimeoutWithdrawalRequest(context.Background(), db, record); err != nil {
-					return fmt.Errorf("ProcessWithdrawalRecords: cannot reject timeout withdrawal request due to %w", err)
+				if err := rejectWithdrawalRequestSafely(context.Background(), db, record, blockchainTransaction); err != nil {
+					return false, fmt.Errorf("ProcessWithdrawalRecords: cannot reject timeout withdrawal request due to %w", err)
 				}
 				logWithdrawalRecordFailed(record, ErrWithdrawalRequestTransactionUnconfirmedTimeout, blockchainTransaction)
 				log.Infof("ProcessWithdrawalRecords: rejected timeout withdrawal record %d after cancelling unbroadcasted blockchain transaction %d", record.ID, blockchainTransaction.ID)
-				return nil
+				return true, nil
 			}
+			return false, nil
 		}
-		blockingMessage := fmt.Sprintf(
-			"withdrawal processor stopped because timeout transaction is not cancellable or terminal: record_id=%d remote_id=%d blockchain_transaction_id=%d transaction_status=%d tx_hash=%s status_message=%s",
-			record.ID,
-			record.RemoteID,
-			blockchainTransaction.ID,
-			blockchainTransaction.Status,
-			blockchainTransaction.TxHash.String,
-			blockchainTransaction.StatusMessage.String,
-		)
-		log.WithFields(log.Fields{
-			"record_id":                 record.ID,
-			"remote_id":                 record.RemoteID,
-			"blockchain_transaction_id": blockchainTransaction.ID,
-			"transaction_status":        blockchainTransaction.Status,
-			"tx_hash":                   blockchainTransaction.TxHash.String,
-			"status_message":            blockchainTransaction.StatusMessage.String,
-		}).Error("ProcessWithdrawalRecords: " + blockingMessage)
-		alert.SafeSendAlert("ProcessWithdrawalRequests", blockingMessage)
-		return ErrWithdrawalRequestTransactionUnconfirmedTimeout
+
+		if err := blockchainTransaction.Sync(ctx, db); err != nil {
+			return false, err
+		}
+		if !blockchainTransaction.CancellationRequestedAt.Valid {
+			return false, nil
+		}
+		settlementTimeout := time.Duration(
+			config.GetConfig().Tasks.ProcessWithdrawalRequests.CancellationSettlementTimeoutSeconds,
+		) * time.Second
+		if !time.Now().Before(blockchainTransaction.CancellationRequestedAt.Time.Add(settlementTimeout)) {
+			return false, stopForBlockingTimeout(record, blockchainTransaction)
+		}
+		return false, nil
 	}
-	if err := rejectTimeoutWithdrawalRequest(context.Background(), db, record); err != nil {
-		return fmt.Errorf("ProcessWithdrawalRecords: cannot reject timeout withdrawal request due to %w", err)
+	if err := rejectWithdrawalRequestSafely(context.Background(), db, record, nil); err != nil {
+		return false, fmt.Errorf("ProcessWithdrawalRecords: cannot reject timeout withdrawal request due to %w", err)
 	}
 	logWithdrawalRecordFailed(record, ErrWithdrawalRequestTransactionUnconfirmedTimeout, nil)
 	log.Infof("ProcessWithdrawalRecords: rejected timeout withdrawal record %d before blockchain transaction creation", record.ID)
-	return nil
+	return true, nil
+}
+
+func stopForBlockingTimeout(record *models.WithdrawRecord, blockchainTransaction *models.BlockchainTransaction) error {
+	blockingMessage := fmt.Sprintf(
+		"withdrawal processor stopped because timeout transaction is not cancellable or terminal: record_id=%d remote_id=%d blockchain_transaction_id=%d transaction_status=%d tx_hash=%s status_message=%s cancellation_requested_at=%v",
+		record.ID,
+		record.RemoteID,
+		blockchainTransaction.ID,
+		blockchainTransaction.Status,
+		blockchainTransaction.TxHash.String,
+		blockchainTransaction.StatusMessage.String,
+		blockchainTransaction.CancellationRequestedAt,
+	)
+	log.WithFields(log.Fields{
+		"record_id":                 record.ID,
+		"remote_id":                 record.RemoteID,
+		"blockchain_transaction_id": blockchainTransaction.ID,
+		"transaction_status":        blockchainTransaction.Status,
+		"tx_hash":                   blockchainTransaction.TxHash.String,
+		"status_message":            blockchainTransaction.StatusMessage.String,
+		"cancellation_requested_at": blockchainTransaction.CancellationRequestedAt,
+	}).Error("ProcessWithdrawalRecords: " + blockingMessage)
+	alert.SafeSendAlert("ProcessWithdrawalRequests", blockingMessage)
+	return ErrWithdrawalRequestTransactionUnconfirmedTimeout
 }
 
 func processWithdrawalRecordWithRetry(ctx context.Context, db *gorm.DB, record *models.WithdrawRecord) error {
@@ -664,7 +996,16 @@ func processWithdrawalRecordWithRetry(ctx context.Context, db *gorm.DB, record *
 
 	for {
 		if time.Now().After(deadline) {
-			return handleTimeoutWithdrawalRequest(ctx, db, record)
+			completed, err := handleTimeoutWithdrawalRequest(ctx, db, record)
+			if err != nil || completed {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Second):
+				continue
+			}
 		}
 
 		recordCtx, cancel := context.WithDeadline(ctx, deadline)
@@ -677,7 +1018,7 @@ func processWithdrawalRecordWithRetry(ctx context.Context, db *gorm.DB, record *
 			return nil
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			return handleTimeoutWithdrawalRequest(ctx, db, record)
+			continue
 		}
 		log.Errorf("ProcessWithdrawalRecords: process withdrawal record %d error %v", record.ID, err)
 		if IsWithdrawalRequestError(err) {

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -87,7 +88,46 @@ func (ts *TransactionSender) run(ctx context.Context) {
 	}
 }
 
-// getPendingTransactions gets pending transactions and adds them to the queue
+func (ts *TransactionSender) collectTransactions(
+	ctx context.Context,
+	fetcher func(context.Context, *gorm.DB, int, int) ([]models.BlockchainTransaction, error),
+) ([]models.BlockchainTransaction, error) {
+	var allTransactions []models.BlockchainTransaction
+	offset := 0
+	for {
+		transactions, err := fetcher(ctx, ts.db, offset, ts.batchSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(transactions) == 0 {
+			break
+		}
+		allTransactions = append(allTransactions, transactions...)
+		offset += len(transactions)
+	}
+	return allTransactions, nil
+}
+
+func (ts *TransactionSender) enqueueTransactions(ctx context.Context, transactions []models.BlockchainTransaction) int {
+	var cnt int
+	for i := range transactions {
+		transaction := transactions[i]
+		_, loaded := ts.processingTxs.LoadOrStore(transaction.ID, struct{}{})
+		if loaded {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			ts.processingTxs.Delete(transaction.ID)
+			return cnt
+		case ts.txQueue <- &transaction:
+			cnt++
+		}
+	}
+	return cnt
+}
+
+// getPendingTransactions gets broadcasting and pending transactions and adds them to the queue
 func (ts *TransactionSender) getPendingTransactions(ctx context.Context) {
 	ticker := time.NewTicker(ts.pollInterval)
 	defer ticker.Stop()
@@ -97,44 +137,25 @@ func (ts *TransactionSender) getPendingTransactions(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Get pending transactions that need to be sent
-			transactions, err := func(ctx context.Context) ([]models.BlockchainTransaction, error) {
-				var allTransactions []models.BlockchainTransaction
-				offset := 0
-				for {
-					transactions, err := models.GetPendingTransactions(ctx, ts.db, offset, ts.batchSize)
-					if err != nil {
-						return nil, err
-					}
+			broadcasting, err := ts.collectTransactions(ctx, models.GetBroadcastingTransactions)
+			if err != nil {
+				log.Errorf("Error getting broadcasting transactions: %v", err)
+				continue
+			}
+			broadcastingCount := ts.enqueueTransactions(ctx, broadcasting)
+			if broadcastingCount > 0 {
+				log.Infof("Processing %d broadcasting transactions for recovery", broadcastingCount)
+			}
 
-					if len(transactions) == 0 {
-						break
-					}
-					allTransactions = append(allTransactions, transactions...)
-					offset += len(transactions)
-				}
-				return allTransactions, nil
-			}(ctx)
+			pending, err := ts.collectTransactions(ctx, models.GetPendingTransactions)
 			if err != nil {
 				log.Errorf("Error getting pending transactions: %v", err)
 				continue
 			}
-			if len(transactions) == 0 {
-				continue
+			pendingCount := ts.enqueueTransactions(ctx, pending)
+			if pendingCount > 0 {
+				log.Infof("Processing %d pending transactions for sending", pendingCount)
 			}
-			var cnt int
-			for _, transaction := range transactions {
-				_, loaded := ts.processingTxs.LoadOrStore(transaction.ID, struct{}{})
-				if !loaded {
-					select {
-					case <-ctx.Done():
-						return
-					case ts.txQueue <- &transaction:
-						cnt++
-					}
-				}
-			}
-			log.Infof("Processing %d pending transactions for sending", cnt)
 		}
 	}
 }
@@ -154,11 +175,19 @@ func (ts *TransactionSender) sendTransaction(ctx context.Context, transaction *m
 		ts.processingTxs.Delete(transaction.ID)
 	}()
 
+	if err := transaction.Sync(ctx, ts.db); err != nil {
+		return err
+	}
+
+	if transaction.Status == models.TransactionStatusBroadcasting {
+		return ts.recoverBroadcastingTransaction(ctx, transaction)
+	}
+
 	if transaction.Status != models.TransactionStatusPending {
 		return nil
 	}
 
-	if transaction.TxHash.Valid {
+	if transaction.TxHash.Valid || transaction.SignedRawTx.Valid {
 		return nil
 	}
 
@@ -166,8 +195,28 @@ func (ts *TransactionSender) sendTransaction(ctx context.Context, transaction *m
 		return nil
 	}
 
+	broadcastingCount, err := models.GetBroadcastingTransactionCountByNetwork(ctx, ts.db, transaction.Network)
+	if err != nil {
+		return err
+	}
+	if broadcastingCount > 0 {
+		log.Infof("Skipping pending transaction %d because network %s has unresolved broadcasting transactions", transaction.ID, transaction.Network)
+		return nil
+	}
+
 	claimed, err := transaction.ClaimForSending(ctx, ts.db)
 	if err != nil {
+		if errors.Is(err, models.ErrRetryAncestorsUnsafe) {
+			msg := fmt.Sprintf(
+				"blocked retry broadcast because ancestors lack proven on-chain failure: transaction_id=%d network=%s retry_transaction_id=%v",
+				transaction.ID,
+				transaction.Network,
+				transaction.RetryTransactionID,
+			)
+			log.Error(msg)
+			alert.SafeSendAlert("TransactionSender", msg)
+			return err
+		}
 		return err
 	}
 	if !claimed {
@@ -209,82 +258,180 @@ func (ts *TransactionSender) sendTransaction(ctx context.Context, transaction *m
 		return err
 	}
 
-	// Send transaction based on type
-	txHash, err := ts.sendRawTransaction(ctx, client, transaction, nonce)
+	signedTx, err := ts.buildSignedTransaction(ctx, client, transaction, nonce)
 	if err != nil {
-		log.Errorf("Failed to send raw transaction %d, nonce: %d, %v", transaction.ID, nonce, err)
+		log.Errorf("Failed to build signed transaction %d, nonce: %d, %v", transaction.ID, nonce, err)
 		err = client.processSendingTxError(err)
 		ts.alertHotWalletBalanceError(transaction, err)
 		if releaseErr := transaction.ReleaseSending(ctx, ts.db, err.Error()); releaseErr != nil {
-			log.Errorf("Failed to release transaction %d after send error: %v", transaction.ID, releaseErr)
+			log.Errorf("Failed to release transaction %d after build error: %v", transaction.ID, releaseErr)
 		}
 		return err
 	}
 
-	// Update transaction status to sent
-	if err := transaction.MarkSent(ctx, ts.db, txHash, int64(nonce)); err != nil {
-		log.Errorf("Failed to mark transaction %d as sent, nonce: %d, %v", transaction.ID, nonce, err)
+	signedRawTx, err := EncodeSignedRawTransaction(signedTx)
+	if err != nil {
+		if releaseErr := transaction.ReleaseSending(ctx, ts.db, err.Error()); releaseErr != nil {
+			log.Errorf("Failed to release transaction %d after encode error: %v", transaction.ID, releaseErr)
+		}
 		return err
 	}
 
-	client.IncrementNonce()
+	prepared, err := transaction.PrepareBroadcast(ctx, ts.db, signedTx.Hash().Hex(), int64(nonce), signedRawTx)
+	if err != nil {
+		if releaseErr := transaction.ReleaseSending(ctx, ts.db, err.Error()); releaseErr != nil {
+			log.Errorf("Failed to release transaction %d after prepare error: %v", transaction.ID, releaseErr)
+		}
+		return err
+	}
+	if !prepared {
+		if releaseErr := transaction.ReleaseSending(ctx, ts.db, "cancellation requested before broadcast"); releaseErr != nil {
+			log.Errorf("Failed to release transaction %d after cancelled prepare: %v", transaction.ID, releaseErr)
+		}
+		return nil
+	}
 
-	log.Infof("Transaction %d sent successfully with hash: %s, nonce: %d", transaction.ID, txHash, nonce)
+	return ts.acknowledgeBroadcast(ctx, client, transaction)
+}
+
+func (ts *TransactionSender) recoverBroadcastingTransaction(ctx context.Context, transaction *models.BlockchainTransaction) error {
+	if !transaction.TxHash.Valid || !transaction.SignedRawTx.Valid || !transaction.Nonce.Valid {
+		msg := fmt.Sprintf("broadcasting transaction %d is missing signed payload", transaction.ID)
+		log.Error(msg)
+		alert.SafeSendAlert("TransactionSender", msg)
+		return errors.New(msg)
+	}
+
+	client, err := GetBlockchainClient(transaction.Network)
+	if err != nil {
+		return err
+	}
+
+	client.NonceMu.Lock()
+	defer client.NonceMu.Unlock()
+
+	visible, err := ts.isTransactionVisibleOnChain(ctx, client, transaction.TxHash.String)
+	if err != nil {
+		return err
+	}
+	if visible {
+		return ts.markBroadcastAcknowledged(ctx, client, transaction)
+	}
+
+	_, err = client.SendSignedRawTransaction(ctx, transaction.SignedRawTx.String)
+	if err != nil {
+		if isAlreadyKnownTransactionError(err) {
+			return ts.markBroadcastAcknowledged(ctx, client, transaction)
+		}
+		visible, visibilityErr := ts.isTransactionVisibleOnChain(ctx, client, transaction.TxHash.String)
+		if visibilityErr != nil {
+			return visibilityErr
+		}
+		if visible {
+			return ts.markBroadcastAcknowledged(ctx, client, transaction)
+		}
+		log.Errorf("Failed to rebroadcast transaction %d: %v", transaction.ID, err)
+		return err
+	}
+
+	return ts.markBroadcastAcknowledged(ctx, client, transaction)
+}
+
+func (ts *TransactionSender) acknowledgeBroadcast(ctx context.Context, client *BlockchainClient, transaction *models.BlockchainTransaction) error {
+	_, err := client.SendSignedRawTransaction(ctx, transaction.SignedRawTx.String)
+	if err != nil {
+		if isAlreadyKnownTransactionError(err) {
+			return ts.markBroadcastAcknowledged(ctx, client, transaction)
+		}
+		visible, visibilityErr := ts.isTransactionVisibleOnChain(ctx, client, transaction.TxHash.String)
+		if visibilityErr != nil {
+			log.Errorf("Failed to send raw transaction %d after prepare: %v", transaction.ID, err)
+			return err
+		}
+		if visible {
+			return ts.markBroadcastAcknowledged(ctx, client, transaction)
+		}
+		log.Errorf("Failed to send raw transaction %d after prepare: %v", transaction.ID, err)
+		return err
+	}
+	return ts.markBroadcastAcknowledged(ctx, client, transaction)
+}
+
+func (ts *TransactionSender) markBroadcastAcknowledged(ctx context.Context, client *BlockchainClient, transaction *models.BlockchainTransaction) error {
+	marked, err := transaction.MarkSent(ctx, ts.db)
+	if err != nil {
+		log.Errorf("Failed to mark transaction %d as sent, hash: %s, nonce: %d, %v", transaction.ID, transaction.TxHash.String, transaction.Nonce.Int64, err)
+		return err
+	}
+	if !marked && transaction.Status != models.TransactionStatusSent {
+		return fmt.Errorf("transaction %d could not be marked sent", transaction.ID)
+	}
+	if transaction.Nonce.Valid {
+		client.AdvanceNoncePast(transaction.Nonce.Int64)
+	}
+	log.Infof("Transaction %d sent successfully with hash: %s, nonce: %d", transaction.ID, transaction.TxHash.String, transaction.Nonce.Int64)
 	return nil
 }
 
-// sendRawTransaction sends a raw transaction to the blockchain
-func (ts *TransactionSender) sendRawTransaction(ctx context.Context, client *BlockchainClient, transaction *models.BlockchainTransaction, nonce uint64) (string, error) {
+func (ts *TransactionSender) isTransactionVisibleOnChain(ctx context.Context, client *BlockchainClient, txHash string) (bool, error) {
+	hash := common.HexToHash(txHash)
+	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	receipt, err := client.RpcClient.TransactionReceipt(callCtx, hash)
+	if err == nil && receipt != nil {
+		return true, nil
+	}
+	if err != nil && !errors.Is(err, ethereum.NotFound) {
+		return false, err
+	}
+
+	transfer, err := client.GetTransactionTransfer(ctx, hash)
+	if err == nil && transfer != nil {
+		return true, nil
+	}
+	if errors.Is(err, ethereum.NotFound) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (ts *TransactionSender) buildSignedTransaction(ctx context.Context, client *BlockchainClient, transaction *models.BlockchainTransaction, nonce uint64) (*types.Transaction, error) {
 	if transaction.FromAddress != client.Address {
-		return "", fmt.Errorf("from address is not the same as the client address")
+		return nil, fmt.Errorf("from address is not the same as the client address")
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	if err := validateHotWalletPayoutBalance(callCtx, client, transaction); err != nil {
-		return "", err
+		return nil, err
 	}
 
 	gasLimit, err := estimateTransactionGasLimit(callCtx, client, transaction)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	gasFeeCap, gasTipCap, err := suggestDynamicFeeCaps(callCtx, client)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if err := validateHotWalletGasBalance(callCtx, client, transaction, gasLimit, gasFeeCap); err != nil {
-		return "", err
+		return nil, err
 	}
 
 	rawTx, err := buildDynamicFeeTransaction(transaction, nonce, gasLimit, gasFeeCap, gasTipCap, client.ChainID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	privateKey, err := crypto.HexToECDSA(client.PrivateKey)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	signedTx, err := types.SignTx(rawTx, types.LatestSignerForChainID(client.ChainID), privateKey)
-	if err != nil {
-		return "", err
-	}
-
-	if err := client.Limiter.Wait(callCtx); err != nil {
-		return "", err
-	}
-
-	err = client.RpcClient.SendTransaction(callCtx, signedTx)
-	if err != nil {
-		err = client.processSendingTxError(err)
-		return "", err
-	}
-
-	return signedTx.Hash().Hex(), nil
+	return types.SignTx(rawTx, types.LatestSignerForChainID(client.ChainID), privateKey)
 }
 
 func isHotWalletBalanceError(err error) bool {
