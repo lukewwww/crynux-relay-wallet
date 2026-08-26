@@ -162,6 +162,105 @@ func TestApplyVestingReleaseLogRejectsFarFutureCreatedAt(t *testing.T) {
 	}
 }
 
+func TestApplyTaskFeeLogBatchRejectsDeprecatedVestingWithoutAdvancingCheckpoint(t *testing.T) {
+	configDir := t.TempDir()
+	configContent := `
+environment: test
+relay:
+  vesting_signer_address: 0x1111111111111111111111111111111111111111
+tasks:
+  process_withdrawal_requests:
+    cancellation_settlement_timeout_seconds: 30
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.yml"), []byte(configContent), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := config.InitConfig(configDir); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := db.AutoMigrate(
+		&models.VestingRecord{},
+		&models.RelayAccount{},
+		&models.TaskFeeCheckpoint{},
+	); err != nil {
+		t.Fatalf("migrate db: %v", err)
+	}
+
+	address := common.HexToAddress("0x2222222222222222222222222222222222222222").Hex()
+	record := models.VestingRecord{
+		RelayVestingID: 42,
+		Address:        address,
+		TotalAmount:    models.BigInt{Int: *big.NewInt(100)},
+		ReleasedAmount: models.BigInt{Int: *big.NewInt(20)},
+		StartTime:      time.Now().UTC().AddDate(0, 0, -10),
+		DurationDays:   10,
+		Type:           models.VestingTypeOther,
+		AdminSignature: "signature",
+		Status:         models.VestingStatusDeprecated,
+	}
+	account := models.RelayAccount{
+		Address: address,
+		Balance: models.BigInt{Int: *big.NewInt(50)},
+	}
+	checkpoint := models.TaskFeeCheckpoint{
+		LatestTaskFeeLogID:        10,
+		LatestTaskFeeLogTimestamp: 100,
+	}
+	if err := db.Create(&record).Error; err != nil {
+		t.Fatalf("create vesting record: %v", err)
+	}
+	if err := db.Create(&account).Error; err != nil {
+		t.Fatalf("create relay account: %v", err)
+	}
+	if err := db.Create(&checkpoint).Error; err != nil {
+		t.Fatalf("create checkpoint: %v", err)
+	}
+
+	err = applyTaskFeeLogBatch(context.Background(), db, []relay_api.TaskFeeLog{
+		{
+			ID:        11,
+			CreatedAt: uint64(time.Now().UTC().Unix()),
+			Address:   address,
+			Amount:    "10",
+			Type:      relay_api.TaskFeeLogTypeVestingRelease,
+			Payload:   `{"vesting_id":42}`,
+		},
+	}, &checkpoint)
+	if !errors.Is(err, ErrTaskFeeVestingReleaseInvalid) {
+		t.Fatalf("expected ErrTaskFeeVestingReleaseInvalid, got %v", err)
+	}
+	if checkpoint.LatestTaskFeeLogID != 10 || checkpoint.LatestTaskFeeLogTimestamp != 100 {
+		t.Fatalf("in-memory checkpoint advanced: %+v", checkpoint)
+	}
+
+	var persistedRecord models.VestingRecord
+	if err := db.First(&persistedRecord, record.ID).Error; err != nil {
+		t.Fatalf("reload vesting record: %v", err)
+	}
+	if persistedRecord.ReleasedAmount.String() != "20" || persistedRecord.Status != models.VestingStatusDeprecated {
+		t.Fatalf("vesting record changed: released=%s status=%d", persistedRecord.ReleasedAmount.String(), persistedRecord.Status)
+	}
+	var persistedAccount models.RelayAccount
+	if err := db.First(&persistedAccount, account.ID).Error; err != nil {
+		t.Fatalf("reload relay account: %v", err)
+	}
+	if persistedAccount.Balance.String() != "50" {
+		t.Fatalf("relay account balance changed: %s", persistedAccount.Balance.String())
+	}
+	var persistedCheckpoint models.TaskFeeCheckpoint
+	if err := db.First(&persistedCheckpoint, checkpoint.ID).Error; err != nil {
+		t.Fatalf("reload checkpoint: %v", err)
+	}
+	if persistedCheckpoint.LatestTaskFeeLogID != 10 || persistedCheckpoint.LatestTaskFeeLogTimestamp != 100 {
+		t.Fatalf("persisted checkpoint advanced: %+v", persistedCheckpoint)
+	}
+}
+
 func TestParseVestingPayloadRequiresValidType(t *testing.T) {
 	validPayload := `{"vesting_id":42,"address":"0x1111111111111111111111111111111111111111","total_amount":"1000","released_amount":"0","start_time":1767225600,"duration_days":30,"type":"delegation","admin_signature":"0xabc"}`
 	payload, err := parseVestingPayload(relay_api.TaskFeeLog{Payload: validPayload})

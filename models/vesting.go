@@ -13,6 +13,7 @@ type VestingStatus int8
 const (
 	VestingStatusActive VestingStatus = iota
 	VestingStatusCompleted
+	VestingStatusDeprecated
 )
 
 const (

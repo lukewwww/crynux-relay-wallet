@@ -20,6 +20,9 @@ Task fee log synchronization starts from `tasks.StartSyncTaskFeeLogs`, which is 
 `GetTaskFeeLogs` supports incremental, gap-free syncing via a pivot ID. On startup, the Relay Wallet reads the last synced task fee log ID from the local database (stored in `models/system.go`). If the record is empty, no prior sync has occurred, so syncing begins at ID=0. Otherwise, the stored ID is passed to the API, which returns records starting from the next ID.
 
 After retrieving records, the wallet updates, within a single database transaction, both the node relay account balances and the latest task fee log ID to ensure they are always consistent.
+Vesting releases are accepted only when the corresponding local vesting record is active. The transition migration marks every existing active, non-deleted local vesting record as deprecated while preserving its released amount, schedule, signature, relay account balance, and task-fee checkpoint. A release for a completed or deprecated record fails validation, rolls back the entire fetched batch, and leaves the checkpoint unchanged. Vesting records created from later accepted `VestingCreated` logs remain active.
+
+`DaoTaskShare` is limited to the DAO share of user-paid task fees. DAO token emission is not a Relay Account log type and is not processed by Wallet log synchronization.
 Detailed type handling rules, validation requirements, checkpoint behavior, and withdrawal gate semantics are specified in [relay_account_log_processing.md](./relay_account_log_processing.md). Implementations MUST follow that specification.
 Deposit-specific validation, deduplication, and fail-fast rules are specified in [deposit_processing.md](./deposit_processing.md). Implementations MUST follow that specification.
 
@@ -55,6 +58,7 @@ Detailed withdrawal request synchronization, validation, execution, callback, ti
 - Model changes are applied via migrations to keep different deployment environments in sync.
 - Any model change must first add a migration under `/migrate`. See `/migrate/migrate.go` for the mechanism.
 - On startup, `/main.go` automatically runs database migrations.
+- Data migrations that intentionally have no business-data rollback leave migrated records unchanged during migration rollback. Restoring the pre-migration business state requires restoring a database backup.
 
 #### Alert
 

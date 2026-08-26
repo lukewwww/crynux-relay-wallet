@@ -36,6 +36,7 @@ For local `relay_accounts.balance`, the wallet MUST apply each log type as follo
 - `VestingRelease` (`type=10`): increase balance (`+amount`) only after local schedule validation
 
 Wallet MUST use an explicit event-type allowlist. Unknown event types MUST fail validation, halt sync, and trigger alert.
+`DaoTaskShare` represents the DAO share of user-paid task fees. DAO token emission MUST NOT be represented as `DaoTaskShare` and MUST NOT enter Wallet log synchronization.
 
 ## Validation Rules Before Balance Apply
 
@@ -58,6 +59,7 @@ For each fetched batch, the wallet MUST validate:
 - For `VestingCreated`, wallet MUST recover signer from payload signature and MUST match configured vesting signer address.
 - For `VestingRelease`, payload MUST include `vesting_id`.
 - For `VestingRelease`, wallet MUST require an existing local vesting record created from an earlier accepted `VestingCreated` event.
+- For `VestingRelease`, the local vesting record MUST have `active` status. A `completed` or `deprecated` record MUST fail with the vesting release validation error.
 - For `VestingRelease`, wallet MUST verify:
   - event `address` equals local vesting record address
   - `release_to = local released_amount + amount`
@@ -75,6 +77,10 @@ After a batch is accepted, the wallet MUST advance:
 - `LatestTaskFeeLogTimestamp`
 
 to the last fetched log in that batch, including batches where all logs are ignored for balance updates.
+
+Balance changes, vesting changes, deposit records, and checkpoint changes for one fetched batch MUST commit in one database transaction. If any log fails validation, including a release for a deprecated vesting record, the entire batch MUST roll back and both checkpoint fields MUST remain unchanged. The synchronization task MUST return the existing validation error so the existing task alert path is triggered.
+
+Local vesting deprecation is applied by database migration to vesting records that are active and not soft-deleted when the migration runs. The migration MUST preserve relay account balances, released amounts, vesting schedule fields, signatures, and task-fee checkpoints. `VestingCreated` logs accepted after the migration MUST continue to create active records.
 
 ## Withdrawal Request Gate Rule
 

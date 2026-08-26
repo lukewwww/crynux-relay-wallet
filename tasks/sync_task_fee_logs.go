@@ -460,6 +460,9 @@ func applyVestingReleaseLog(ctx context.Context, tx *gorm.DB, eventLog relay_api
 		return err
 	}
 
+	if record.Status != models.VestingStatusActive {
+		return ErrTaskFeeVestingReleaseInvalid
+	}
 	if !strings.EqualFold(record.Address, eventLog.Address) {
 		return ErrTaskFeeVestingReleaseInvalid
 	}
@@ -823,6 +826,30 @@ func logDepositCreditFailures(logs []relay_api.TaskFeeLog, creditErr error) {
 	}
 }
 
+func applyTaskFeeLogBatch(ctx context.Context, db *gorm.DB, logs []relay_api.TaskFeeLog, checkpoint *models.TaskFeeCheckpoint) error {
+	nextCheckpoint := *checkpoint
+	nextCheckpoint.LatestTaskFeeLogID = logs[len(logs)-1].ID
+	nextCheckpoint.LatestTaskFeeLogTimestamp = logs[len(logs)-1].CreatedAt
+
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := saveDepositRecords(ctx, tx, logs); err != nil {
+			return err
+		}
+		if err := applyVestingLogs(ctx, tx, logs); err != nil {
+			return err
+		}
+		if err := processTaskFeeLogs(ctx, tx, logs); err != nil {
+			return err
+		}
+
+		return tx.Save(&nextCheckpoint).Error
+	}); err != nil {
+		return err
+	}
+	*checkpoint = nextCheckpoint
+	return nil
+}
+
 func syncTaskFeeLogs(ctx context.Context, intervalSeconds uint) error {
 	db := config.GetDB()
 
@@ -853,22 +880,7 @@ func syncTaskFeeLogs(ctx context.Context, intervalSeconds uint) error {
 			return err
 		}
 
-		if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := saveDepositRecords(ctx, tx, logs); err != nil {
-				return err
-			}
-			if err := applyVestingLogs(ctx, tx, logs); err != nil {
-				return err
-			}
-
-			if err := processTaskFeeLogs(ctx, tx, logs); err != nil {
-				return err
-			}
-
-			checkpoint.LatestTaskFeeLogID = logs[len(logs)-1].ID
-			checkpoint.LatestTaskFeeLogTimestamp = logs[len(logs)-1].CreatedAt
-			return tx.Save(&checkpoint).Error
-		}); err != nil {
+		if err := applyTaskFeeLogBatch(ctx, db, logs, &checkpoint); err != nil {
 			logDepositCreditFailures(logs, err)
 			return err
 		}
